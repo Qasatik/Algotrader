@@ -72,13 +72,20 @@ class CarryResult:
     trade_pnls: np.ndarray
 
 
-def run_carry_backtest(rates: pd.Series, cfg: CarryConfig | None = None) -> CarryResult:
+def run_carry_backtest(
+    rates: pd.Series,
+    cfg: CarryConfig | None = None,
+    signal: pd.Series | None = None,
+) -> CarryResult:
     """Run the delta-neutral funding carry strategy.
 
     Args:
         rates: funding rates indexed by timestamp (8h frequency). Values are the
-            raw funding rate (e.g. 0.0001 == 0.01%).
+            raw funding rate (e.g. 0.0001 == 0.01%). Used for *collection*.
         cfg: strategy / cost configuration.
+        signal: optional decision signal (e.g. ML-predicted next funding). When
+            provided, entry/exit decisions use ``|signal|`` while collection still
+            uses the actual ``rates``. Defaults to ``rates`` (decide on current).
 
     Returns:
         CarryResult with equity curve, per-trade PnL and summary metrics.
@@ -89,6 +96,7 @@ def run_carry_backtest(rates: pd.Series, cfg: CarryConfig | None = None) -> Carr
     """
     cfg = cfg or CarryConfig()
     r = rates.to_numpy(dtype="float64")
+    s = signal.to_numpy(dtype="float64") if signal is not None else r
     n = len(r)
 
     equity = np.ones(n)
@@ -104,7 +112,8 @@ def run_carry_backtest(rates: pd.Series, cfg: CarryConfig | None = None) -> Carr
     events_in_market = 0
 
     for i in range(n):
-        rate = r[i]
+        rate = r[i]  # actual rate → drives collection
+        sig = s[i]  # decision signal (predicted or current)
         if in_position:
             # Correctly positioned → receive |rate| (funding cash flow).
             gain = abs(rate)
@@ -112,13 +121,13 @@ def run_carry_backtest(rates: pd.Series, cfg: CarryConfig | None = None) -> Carr
             collected_this_trade += gain
             hold_count += 1
             events_in_market += 1
-            # Exit when funding normalises or max hold reached.
-            if abs(rate) < cfg.exit_threshold or hold_count >= cfg.max_hold_events:
+            # Exit when the *signal* normalises or max hold reached.
+            if abs(sig) < cfg.exit_threshold or hold_count >= cfg.max_hold_events:
                 eq *= 1.0 - exit_cost
                 trade_pnls.append(collected_this_trade - cfg.round_trip_cost)
                 in_position = False
                 collected_this_trade = 0.0
-        elif abs(rate) >= cfg.entry_threshold:
+        elif abs(sig) >= cfg.entry_threshold:
             # Enter a fresh delta-neutral position (pay entry half of costs).
             eq *= 1.0 - entry_cost
             in_position = True

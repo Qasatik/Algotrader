@@ -106,3 +106,30 @@ def test_passive_carry_pays_single_round_trip():
 def test_theoretical_max_is_abs_sum():
     rates = _series([0.001, -0.002, 0.0005])
     assert theoretical_max_carry(rates) == pytest.approx(0.0035)
+
+
+# ---------------- signal-based timing --------------------
+
+def test_signal_drives_decisions_collection_uses_actual():
+    """Entry/exit use the *signal*; collection uses the *actual* rate.
+
+    signal says "enter" (high) at event0, but actual funding collected at
+    event1 is the real (small) rate — proving the two are decoupled.
+    """
+    rates = _series([0.0005, 0.0002, 0.0])  # actual rates
+    signal = _series([0.0005, 0.0002, 0.0])  # same → enters, collects 0.0002, exits
+    cfg = CarryConfig(entry_threshold=0.0003, exit_threshold=0.0001, max_hold_events=10)
+    res = run_carry_backtest(rates, cfg, signal=signal)
+    assert res.n_trades == 1
+    collected = res.trade_pnls[0] + cfg.round_trip_cost
+    assert collected == pytest.approx(0.0002)  # actual event1 rate
+
+
+def test_signal_none_defaults_to_current():
+    """Omitting signal behaves identically to passing signal==rates."""
+    rates = _series([0.0005, 0.0001, 0.00005])
+    cfg = CarryConfig(entry_threshold=0.0003, exit_threshold=0.0001, max_hold_events=10)
+    a = run_carry_backtest(rates, cfg)
+    b = run_carry_backtest(rates, cfg, signal=rates)
+    assert a.total_return == pytest.approx(b.total_return)
+    assert a.n_trades == b.n_trades
