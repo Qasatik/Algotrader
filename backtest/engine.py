@@ -38,6 +38,12 @@ class BacktestConfig:
     slippage: float = 0.0002       # 0.02% per side
     funding_per_bar: float = 0.0   # set >0 to charge funding on held pos
     position_size: float = 1.0     # fraction of equity per trade
+    use_maker: bool = True         # assume maker fills (bot tries maker first)
+
+    @property
+    def round_trip_fee(self) -> float:
+        """Per-side fee: maker rebate if enabled, else taker."""
+        return self.fee_maker if self.use_maker else self.fee_taker
 
 
 def run_backtest(
@@ -45,11 +51,19 @@ def run_backtest(
     closes: np.ndarray,
     cfg: BacktestConfig | None = None,
     periods_per_year: int = 365 * 24,
+    min_holding_bars: int = 0,
+    confidence: np.ndarray | None = None,
+    conf_threshold: float = 0.0,
 ) -> tuple[pd.Series, np.ndarray, PerformanceReport]:
-    """Vectorized backtest over aligned predictions and close prices.
+    """Backtest over aligned predictions and close prices.
 
     predictions: int array (0=down/short, 1=flat, 2=up/long)
     closes:      float array of close prices (same length)
+    min_holding_bars: once a position is opened, hold it at least this many
+        bars before an exit/flip is allowed — this is the key lever against
+        overtrading (commissions are what killed the naive version).
+    confidence: optional per-bar max softmax probability; bars below
+        ``conf_threshold`` are forced to FLAT (skip low-conviction trades).
     Returns (equity_curve, pnl_per_trade, report).
     """
     if cfg is None:
@@ -62,14 +76,37 @@ def run_backtest(
     target = np.where(pred == LABEL_UP, 1.0,
               np.where(pred == LABEL_DOWN, -1.0, 0.0))
 
+    # Confidence gate: suppress low-conviction signals to flat
+    if confidence is not None and conf_threshold > 0.0:
+        target[confidence < conf_threshold] = 0.0
+
+    # Resolve the actual position vector, honouring the minimum holding period.
+    if min_holding_bars > 0:
+        pos = np.zeros(n)
+        cur = 0.0
+        held = 0
+        for i in range(n):
+            tgt = target[i]
+            if cur == 0.0:
+                # flat -> may enter immediately on a non-zero signal
+                if tgt != 0.0:
+                    cur = tgt
+                    held = 1
+            elif held >= min_holding_bars and tgt != cur:
+                # held long enough and target changed -> switch/exit
+                cur = tgt
+                held = 1 if tgt != 0.0 else 0
+            else:
+                held += 1
+            pos[i] = cur
+    else:
+        pos = target.copy()
+
     # Detect position changes -> incur costs on turnover
-    prev = np.concatenate([[0.0], target[:-1]])
-    turnover = np.abs(target - prev)
+    prev = np.concatenate([[0.0], pos[:-1]])
+    turnover = np.abs(pos - prev)
+    cost_per_bar = turnover * (cfg.round_trip_fee + cfg.slippage)
 
-    cost_per_bar = turnover * (cfg.fee_taker + cfg.slippage)
-
-    # Position vector: +1 long, -1 short, 0 flat
-    pos = target.copy()
     px_ret = np.zeros(n)
     px_ret[1:] = (px[1:] - px[:-1]) / px[:-1]
     # PnL = position * next-bar return
@@ -85,15 +122,15 @@ def run_backtest(
     entry_idx = 0
     cur_dir = 0.0
     for i in range(n):
-        if target[i] != 0 and not in_trade:
+        if pos[i] != 0 and not in_trade:
             in_trade = True
             entry_idx = i
-            cur_dir = target[i]
-        elif in_trade and (target[i] != cur_dir or target[i] == 0):
+            cur_dir = pos[i]
+        elif in_trade and (pos[i] != cur_dir or pos[i] == 0):
             pnl_trades.append(float(net_ret[entry_idx:i].sum()))
-            in_trade = target[i] != 0
+            in_trade = pos[i] != 0
             entry_idx = i
-            cur_dir = target[i]
+            cur_dir = pos[i]
     if in_trade:
         pnl_trades.append(float(net_ret[entry_idx:].sum()))
 
@@ -108,7 +145,9 @@ def backtest_oracle(symbol: str, interval: str = "1") -> PerformanceReport:
     cost model and shows the ceiling the model could approach if perfect.
     """
     ds = build_dataset(symbol=symbol, interval=interval)
-    eq, trades, rep = run_backtest(ds.y, ds.closes)
+    # Hold each position for the label horizon so the oracle captures the full
+    # barrier move instead of flipping every bar (which commissions destroy).
+    eq, trades, rep = run_backtest(ds.y, ds.closes, min_holding_bars=15)
     log.info("oracle_backtest", symbol=symbol,
              total_return=round(rep.total_return, 4),
              sharpe=round(rep.sharpe, 2),
@@ -146,11 +185,17 @@ def backtest_trained_model(symbol: str, interval: str = "1") -> PerformanceRepor
     model.load_state_dict(state)
     model.eval()
 
-    preds = (
-        model(torch.from_numpy(Xte).to(device)).argmax(dim=-1).cpu().numpy()
-    )
+    logits = model(torch.from_numpy(Xte).to(device))
+    probs = torch.softmax(logits, dim=-1)
+    preds = probs.argmax(dim=-1).cpu().numpy()
+    conf = probs.max(dim=-1).values.cpu().numpy()
 
-    eq, trades, rep = run_backtest(preds, test_closes)
+    # Hold positions for the label horizon AND only trade on high-conviction
+    # signals — both drastically cut trade count and commission drag.
+    eq, trades, rep = run_backtest(
+        preds, test_closes, min_holding_bars=15,
+        confidence=conf, conf_threshold=settings.ml_confidence_threshold,
+    )
     acc = float((preds == yte).mean())
     log.info("trained_model_backtest", symbol=symbol, device=device,
              test_samples=len(yte), test_acc=round(acc, 4),
