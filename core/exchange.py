@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from pybit.exceptions import InvalidRequestError
 from pybit.unified_trading import HTTP
 from tenacity import (
     retry,
@@ -74,6 +75,10 @@ class BybitExchange:
         start = time.perf_counter()
         try:
             result: dict[str, Any] = getattr(self._session, method)(**kwargs)
+        except InvalidRequestError as exc:
+            # pybit raises this for API-level rejections (retCode != 0).
+            # Convert to ExchangeError so callers can pattern-match error codes.
+            raise ExchangeError(str(exc)) from exc
         except Exception as exc:  # network / HTTP error
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             self._log.warning(
