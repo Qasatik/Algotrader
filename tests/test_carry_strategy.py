@@ -99,16 +99,73 @@ def test_holds_when_basis_within_guard():
 # ---------------- funding-sign exit --------------------
 
 def test_exits_when_funding_turns_negative():
+    """Severe negative funding (projected loss > close cost) triggers exit."""
     ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
-    s = CarryStrategy(ex, CarryConfig(close_funding=-0.0001, rebalance_drift_bps=200.0))
+    s = CarryStrategy(ex, CarryConfig(
+        close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=1))
     s.decide()  # open
-    # Funding flips strongly negative
+    # -0.0004 × 10 cycles × 10000 = 40 bps projected loss > 31 bps close cost
     ex.get_funding_rate.return_value = {
-        "fundingRate": "-0.0003", "markPrice": "65000", "lastPrice": "65000"
+        "fundingRate": "-0.0004", "markPrice": "65000", "lastPrice": "65000"
     }
     act = s.decide()
     assert act.action == "close"
     assert s.state == CarryState.FLAT
+
+
+def test_mild_negative_funding_holds():
+    """Negative funding below threshold but projected loss < close cost → hold."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=1))
+    s.decide()  # open
+    # -0.0002 × 10 × 10000 = 20 bps < 31 bps → not worth closing
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "-0.0002", "markPrice": "65000", "lastPrice": "65000"
+    }
+    act = s.decide()
+    assert act.action == "none"
+    assert s.state == CarryState.HEDGED
+
+
+def test_exit_requires_confirmation():
+    """Severe negative funding requires exit_confirm_polls consecutive warrants."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=3))
+    s.decide()  # open
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "-0.0004", "markPrice": "65000", "lastPrice": "65000"
+    }
+    assert s.decide().action == "none"  # poll 1/3
+    assert s.decide().action == "none"  # poll 2/3
+    act = s.decide()  # poll 3/3 → confirmed
+    assert act.action == "close"
+    assert s.state == CarryState.FLAT
+
+
+def test_exit_counter_resets_on_recovery():
+    """If funding recovers before confirmation, the exit counter resets."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=3))
+    s.decide()  # open
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "-0.0004", "markPrice": "65000", "lastPrice": "65000"
+    }
+    s.decide()  # 1/3
+    s.decide()  # 2/3
+    # Funding recovers → counter resets
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "0.0002", "markPrice": "65000", "lastPrice": "65000"
+    }
+    s.decide()
+    assert s._exit_signals == 0
+    # Severe again — should need 3 more, not just 1
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "-0.0004", "markPrice": "65000", "lastPrice": "65000"
+    }
+    assert s.decide().action == "none"  # 1/3 again
 
 
 # ---------------- rebalance --------------------
@@ -224,10 +281,12 @@ def test_no_trade_log_when_disabled(tmp_path: Path):
 def test_trade_log_close_appends_row(tmp_path: Path):
     log_path = str(tmp_path / "trades.csv")
     ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
-    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001, trade_log=log_path))
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, trade_log=log_path, exit_confirm_polls=1))
     s.run_once()
+    # -0.0004 × 10 × 10000 = 40 bps > 31 bps close cost → EV-gated exit
     ex.get_funding_rate.return_value = {
-        "fundingRate": "-0.0002", "markPrice": "65000", "lastPrice": "65000"
+        "fundingRate": "-0.0004", "markPrice": "65000", "lastPrice": "65000"
     }
     s.run_once()
     with open(log_path) as f:

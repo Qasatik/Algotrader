@@ -53,7 +53,12 @@ class CarryConfig:
     leverage: int = 2  # perp leverage (≤2× = conservative)
     equity_fraction: float = 0.5  # notional = fraction × equity (see sizing note)
     min_funding_to_open: float = 0.0001  # open when funding ≥ 0.01%
-    close_funding: float = -0.0001  # flatten if funding goes negative (< -0.01%)
+    close_funding: float = -0.0001  # consider exit when funding < this (< -0.01%)
+    # EV-gated exit: don't close on mild/transient negative funding — only when
+    # the projected holding loss exceeds the round-trip close cost.
+    exit_cost_bps: float = 31.0  # round-trip fee to close (perp+spot taker+slippage)
+    exit_hold_horizon: int = 10  # funding cycles (8h) projected: hold-vs-close break-even
+    exit_confirm_polls: int = 3  # consecutive warranted polls before closing (anti-churn)
     basis_guard_bps: float = 50.0  # flatten if perp premium > 50 bps (0.5%)
     rebalance_drift_bps: float = 20.0  # rebalance hedge if basis drifts > 20 bps
     rebalance_min_btc: float = 0.001  # min BTC mismatch to trigger a corrective order
@@ -99,6 +104,7 @@ class CarryStrategy:
         self.state = CarryState.FLAT
         self.position_qty: float = 0.0
         self.entry_basis_bps: float = 0.0
+        self._exit_signals: int = 0  # consecutive EV-warranted exit polls
 
     # ------------------------------------------------------------------
     # Startup reconciliation (P0-1)
@@ -245,16 +251,40 @@ class CarryStrategy:
                 funding_rate=funding,
                 basis_bps=basis,
             )
-        # 2) Funding turned negative — carry no longer pays, exit.
+        # 2) EV-gated exit: only close when the projected holding loss from
+        #    continuing to pay negative funding exceeds the round-trip close
+        #    cost. This avoids churning out on transient/mild negative funding
+        #    where paying the close fee would cost more than riding it out.
         if funding < self.cfg.close_funding:
-            self.state = CarryState.FLAT
-            self.position_qty = 0.0
-            return CarryAction(
-                "close",
-                f"funding {funding*100:.4f}% < {self.cfg.close_funding*100:.4f}%",
-                funding_rate=funding,
-                basis_bps=basis,
-            )
+            projected_loss_bps = abs(funding) * self.cfg.exit_hold_horizon * 10_000.0
+            if projected_loss_bps > self.cfg.exit_cost_bps:
+                self._exit_signals += 1
+                if self._exit_signals >= self.cfg.exit_confirm_polls:
+                    self._exit_signals = 0
+                    self.state = CarryState.FLAT
+                    self.position_qty = 0.0
+                    return CarryAction(
+                        "close",
+                        f"EV exit: hold-loss {projected_loss_bps:.0f}bps > "
+                        f"close-cost {self.cfg.exit_cost_bps:.0f}bps "
+                        f"({self.cfg.exit_confirm_polls}× confirmed)",
+                        funding_rate=funding,
+                        basis_bps=basis,
+                    )
+                # Severe enough to warrant exit, but not yet confirmed N times.
+                return CarryAction(
+                    "none",
+                    f"EV exit pending ({self._exit_signals}/"
+                    f"{self.cfg.exit_confirm_polls}): hold-loss "
+                    f"{projected_loss_bps:.0f}bps",
+                    funding_rate=funding,
+                    basis_bps=basis,
+                )
+            # Mild negative funding — not worth paying the close cost. Hold on.
+            self._exit_signals = 0
+        else:
+            # Funding positive/neutral — reset the exit confirmation counter.
+            self._exit_signals = 0
         # 3) Hedge drift — keep perp and spot notionals aligned.
         if abs(basis - self.entry_basis_bps) > self.cfg.rebalance_drift_bps:
             return CarryAction(
