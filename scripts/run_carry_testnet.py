@@ -65,6 +65,8 @@ def main() -> None:
                     help="polls between heartbeat Telegram messages (default 720 ≈ 1h at 5s)")
     ap.add_argument("--no-notify", action="store_true",
                     help="disable Telegram push notifications")
+    ap.add_argument("--stop-loss-pct", type=float, default=15.0,
+                    help="exchange-side stop-loss %% from entry (default 15%%, 0=off)")
     args = ap.parse_args()
 
     # Safety: require explicit confirmation for real-money mainnet trading.
@@ -93,6 +95,7 @@ def main() -> None:
         strong_funding=args.strong_funding,
         size_mult_min=args.size_mult_min,
         size_mult_max=args.size_mult_max,
+        stop_loss_pct=args.stop_loss_pct,
         paper_equity=args.paper_equity if args.dry_run else None,
         # Always log trades to CSV (local persistent history) unless dry-run.
         trade_log=None if args.dry_run else DEFAULT_TRADE_LOG,

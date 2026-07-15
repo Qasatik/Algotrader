@@ -70,6 +70,11 @@ class CarryConfig:
     paper_equity: float | None = None  # if set, override wallet balance (dry-run)
     max_notional: float | None = None  # hard cap on position notional (USDT safety)
     trade_log: str | None = None  # CSV path for persistent trade history (None=off)
+    # Exchange-side backstop stop-loss (protects while bot is OFFLINE).
+    # Set as a Bybit trading-stop order on the perp short after opening.
+    # 0 = disabled.  For a short, SL triggers when price RISES by this %.
+    stop_loss_pct: float = 15.0  # close perp if price rises 15% (well below 2× liq)
+    liq_warning_pct: float = 15.0  # alert if mark price within 15% of liq price
 
 
 @dataclass
@@ -144,6 +149,8 @@ class CarryStrategy:
             mark = _safe_float(fr.get("markPrice")) or _safe_float(fr.get("lastPrice"))
             spot = self.exchange.get_spot_price(self.cfg.symbol) or 0.0
             self.entry_basis_bps = _basis_bps(mark, spot)
+            # Re-verify the exchange-side stop-loss is in place after restart.
+            self._set_exchange_stop_loss(mark)
             log.info("carry_reconcile_hedged", perp=perp_size, spot=spot_size)
             return f"resumed HEDGED position (perp {perp_size}, spot {spot_size} BTC)"
         # Orphaned perp short with no hedge = NAKED SHORT (dangerous) → flatten.
@@ -395,6 +402,8 @@ class CarryStrategy:
             self.state = CarryState.FLAT
             self.position_qty = 0.0
             raise
+        # Set exchange-side backstop stop-loss (protects while bot is offline).
+        self._set_exchange_stop_loss(act.perp_price or price)
         return {"perp": perp, "spot": spot}
 
     def _emergency_close_perp(self, qty: float) -> None:
@@ -420,8 +429,39 @@ class CarryStrategy:
             "symbol": self.cfg.symbol, "side": "Sell",
             "orderType": "Market", "qty": str(qty),
         })
+        # Clear the exchange-side stop-loss (position is gone).
+        self._clear_exchange_stop_loss()
         self.position_qty = 0.0
         return {"perp": perp, "spot": spot}
+
+    # ------------------------------------------------------------------
+    # Exchange-side backstop stop-loss
+    # ------------------------------------------------------------------
+    def _set_exchange_stop_loss(self, entry_price: float) -> None:
+        """Set a Bybit trading-stop SL on the perp short.
+
+        This order lives on Bybit's servers and triggers **even when the bot
+        is offline** — the last line of defence against a short squeeze.
+        For a short, the SL price is *above* entry (price rising = loss).
+        """
+        if self.cfg.stop_loss_pct <= 0 or entry_price <= 0:
+            return
+        sl_price = entry_price * (1 + self.cfg.stop_loss_pct / 100.0)
+        try:
+            self.exchange.set_trading_stop(
+                self.cfg.symbol, stop_loss=str(round(sl_price, 1))
+            )
+            log.info("carry_stop_loss_set", sl_price=sl_price, pct=self.cfg.stop_loss_pct)
+        except Exception as exc:
+            log.warning("carry_stop_loss_set_failed", error=str(exc))
+
+    def _clear_exchange_stop_loss(self) -> None:
+        """Remove the exchange-side stop-loss (called on close)."""
+        try:
+            self.exchange.set_trading_stop(self.cfg.symbol, stop_loss="0")
+            log.info("carry_stop_loss_cleared")
+        except Exception as exc:
+            log.warning("carry_stop_loss_clear_failed", error=str(exc))
 
     def _leg_sizes(self) -> tuple[float, float]:
         """Actual ``(perp_short_size_btc, spot_long_size_btc)`` from the exchange.

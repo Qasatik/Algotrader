@@ -231,6 +231,30 @@ class BybitExchange:
                 return {}
             raise
 
+    def set_trading_stop(
+        self, symbol: str, stop_loss: str | None = None,
+        take_profit: str | None = None, trigger_by: str = "MarkPrice",
+    ) -> dict[str, Any]:
+        """Set / clear exchange-side stop-loss and take-profit for a position.
+
+        These orders live on Bybit's servers and trigger **even when the bot
+        is offline** — critical backstop protection.  Pass ``"0"`` to clear.
+
+        For a SHORT position the stop-loss price should be *above* entry
+        (price rising against the short).
+        """
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "tpslMode": "Full",
+            "slTriggerBy": trigger_by,
+        }
+        if stop_loss is not None:
+            params["stopLoss"] = stop_loss
+        if take_profit is not None:
+            params["takeProfit"] = take_profit
+        return self._request("set_trading_stop", **params)
+
     def place_order(self, params: dict[str, Any]) -> dict[str, Any]:
         """Submit an order. See OrderManager for how `params` is built."""
         return self._request("place_order", category="linear", **params)
