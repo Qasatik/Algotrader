@@ -131,6 +131,27 @@ class BybitExchange:
             "get_orderbook", category="linear", symbol=symbol, limit=limit
         )
 
+    def get_funding_rate(self, symbol: str) -> dict[str, Any]:
+        """Current funding rate + next funding time for a linear perp.
+
+        Returns a dict with ``fundingRate`` (fraction, e.g. 0.0001 == 0.01%),
+        ``nextFundingTime`` (ms) and ``markPrice``.
+        """
+        res = self._request("get_tickers", category="linear", symbol=symbol)
+        lst = res.get("list", [])
+        return lst[0] if lst else {}
+
+    def get_spot_price(self, symbol: str) -> float | None:
+        """Last traded price on the spot market (for basis / hedge calc)."""
+        res = self._request("get_tickers", category="spot", symbol=symbol)
+        lst = res.get("list", [])
+        if not lst:
+            return None
+        try:
+            return float(lst[0].get("lastPrice", 0.0)) or None
+        except (TypeError, ValueError):
+            return None
+
     # ------------------------------------------------------------------
     # Account / trading
     # ------------------------------------------------------------------
@@ -166,6 +187,10 @@ class BybitExchange:
     def place_order(self, params: dict[str, Any]) -> dict[str, Any]:
         """Submit an order. See OrderManager for how `params` is built."""
         return self._request("place_order", category="linear", **params)
+
+    def place_spot_order(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Submit a spot order (the long hedge leg of the carry pair)."""
+        return self._request("place_order", category="spot", **params)
 
     def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
         return self._request(
