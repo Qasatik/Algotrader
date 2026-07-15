@@ -25,7 +25,7 @@
 **Тесты:** `test_reconciles_open_position_on_startup`,
 `test_flattens_orphaned_leg_on_startup`.
 
-### 2. Реализовать настоящую ребалансировку  🔴
+### 2. Реализовать настоящую ребалансировку  ✅ (commit 92baef1)
 **Проблема:** [`_rebalance()`](core/carry_strategy.py:305) — **заглушка,
 которая ничего не делает**: логирует «rebalance» и возвращает
 `{"rebalanced": True}` без единой заявки. Когда базис уплывает >20bps,
@@ -40,7 +40,7 @@ SELL — в **BTC**.
 
 **Тесты:** `test_rebalance_trims_oversized_leg`, `test_rebalance_noop_when_aligned`.
 
-### 3. Разделить «остановку бота» и «закрытие позиции»  🟠
+### 3. Разделить «остановку бота» и «закрытие позиции»  ✅ (commit 92baef1)
 **Проблема:** [`run_carry_testnet.py:128`](scripts/run_carry_testnet.py:128)
 автоматически закрывает позицию по SIGINT. Для кэрри-трейда обычно хочется
 **продолжать собирать фандинг** между рестартами — закрытие на каждой
