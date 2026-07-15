@@ -3,6 +3,8 @@ import csv
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from core.carry_strategy import CarryConfig, CarryState, CarryStrategy
 
 
@@ -177,3 +179,22 @@ def test_trade_log_close_appends_row(tmp_path: Path):
     actions = [r["action"] for r in rows]
     assert "open" in actions
     assert "close" in actions
+
+
+# ---------------- rollback safety --------------------
+
+def test_open_rolls_back_perp_if_spot_fails():
+    """If the spot hedge fails, the perp short must be closed immediately."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex.place_spot_order.side_effect = RuntimeError("spot failed")
+    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
+    act = s.decide()
+    assert act.action == "open"
+    with pytest.raises(RuntimeError, match="spot failed"):
+        s.execute(act)
+    assert s.state == CarryState.FLAT
+    assert s.position_qty == 0.0
+    assert ex.place_order.call_count == 2
+    close_call = ex.place_order.call_args_list[1]
+    assert close_call.args[0]["side"] == "Buy"
+    assert close_call.args[0]["reduceOnly"] is True

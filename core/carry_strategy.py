@@ -257,11 +257,31 @@ class CarryStrategy:
             "orderType": "Market", "qty": str(act.qty),
         })
         # Long the spot hedge at notional ≈ qty × price (market).
-        spot = self.exchange.place_spot_order({
-            "symbol": self.cfg.symbol, "side": act.spot_side,
-            "orderType": "Market", "qty": str(act.qty),
-        })
+        # CRITICAL: if the spot leg fails we must ROLL BACK the perp short
+        # immediately — an unhedged short has unlimited loss risk (squeeze).
+        try:
+            spot = self.exchange.place_spot_order({
+                "symbol": self.cfg.symbol, "side": act.spot_side,
+                "orderType": "Market", "qty": str(act.qty),
+            })
+        except Exception as exc:
+            log.error("carry_open_spot_failed", error=str(exc))
+            self._emergency_close_perp(act.qty)
+            self.state = CarryState.FLAT
+            self.position_qty = 0.0
+            raise
         return {"perp": perp, "spot": spot}
+
+    def _emergency_close_perp(self, qty: float) -> None:
+        """Best-effort close of an unhedged perp short after a spot failure."""
+        try:
+            self.exchange.place_order({
+                "symbol": self.cfg.symbol, "side": "Buy",
+                "orderType": "Market", "qty": str(qty), "reduceOnly": True,
+            })
+            log.warning("carry_open_rolled_back", qty=qty)
+        except Exception as rb_exc:
+            log.error("carry_open_rollback_failed", qty=qty, error=str(rb_exc))
 
     def _close(self, act: CarryAction) -> dict:
         qty = act.qty or self.position_qty
