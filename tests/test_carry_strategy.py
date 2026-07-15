@@ -131,6 +131,10 @@ def test_execute_open_places_both_legs():
     ex.place_spot_order.assert_called_once()  # spot long
     # perp order is a Sell (short) — params passed as a positional dict
     assert ex.place_order.call_args.args[0]["side"] == "Sell"
+    # spot Market BUY qty is in USDT (quote), not BTC (base)
+    # qty_btc=0.076, price=65000 → spot qty ≈ 4940 USDT
+    spot_qty = float(ex.place_spot_order.call_args.args[0]["qty"])
+    assert 4900 < spot_qty < 5000  # ≈ 0.076 × 65000
 
 
 def test_run_once_decides_and_executes():

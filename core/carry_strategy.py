@@ -256,13 +256,17 @@ class CarryStrategy:
             "symbol": self.cfg.symbol, "side": act.perp_side,
             "orderType": "Market", "qty": str(act.qty),
         })
-        # Long the spot hedge at notional ≈ qty × price (market).
+        # Long the spot hedge.  Bybit V5 spot Market BUY takes qty in QUOTE
+        # currency (USDT), not base (BTC) — so we convert qty_btc → USDT
+        # notional.  (Market SELL still uses base-currency qty; see _close.)
         # CRITICAL: if the spot leg fails we must ROLL BACK the perp short
         # immediately — an unhedged short has unlimited loss risk (squeeze).
+        price = act.spot_price or act.perp_price
+        spot_qty_usdt = round(act.qty * price, 2) if price > 0 else 0.0
         try:
             spot = self.exchange.place_spot_order({
                 "symbol": self.cfg.symbol, "side": act.spot_side,
-                "orderType": "Market", "qty": str(act.qty),
+                "orderType": "Market", "qty": str(spot_qty_usdt),
             })
         except Exception as exc:
             log.error("carry_open_spot_failed", error=str(exc))
