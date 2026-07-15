@@ -20,6 +20,7 @@ mock exchange. ``execute()`` turns an action into real orders.
 from __future__ import annotations
 
 import csv
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -75,6 +76,14 @@ class CarryConfig:
     # 0 = disabled.  For a short, SL triggers when price RISES by this %.
     stop_loss_pct: float = 15.0  # close perp if price rises 15% (well below 2× liq)
     liq_warning_pct: float = 15.0  # alert if mark price within 15% of liq price
+    # Max hold time: close the position after this many hours regardless of
+    # funding (prevents holding a decaying position forever). 0 = unlimited.
+    max_hold_hours: float = 0.0
+
+    @property
+    def base_coin(self) -> str:
+        """Base currency derived from symbol (BTCUSDT → BTC, ETHUSDT → ETH)."""
+        return self.symbol.replace("USDT", "")
 
 
 @dataclass
@@ -110,6 +119,8 @@ class CarryStrategy:
         self.position_qty: float = 0.0
         self.entry_basis_bps: float = 0.0
         self._exit_signals: int = 0  # consecutive EV-warranted exit polls
+        self._entry_time: float | None = None  # epoch seconds when position opened
+        self._poll_count: int = 0  # total decide() calls (for throttling checks)
 
     # ------------------------------------------------------------------
     # Startup reconciliation (P0-1)
@@ -134,9 +145,9 @@ class CarryStrategy:
                 break
         spot_size = 0.0
         try:
-            res = self.exchange.get_wallet_balance("BTC")
+            res = self.exchange.get_wallet_balance(self.cfg.base_coin)
             for c in res["list"][0]["coin"]:
-                if c.get("coin") == "BTC":
+                if c.get("coin") == self.cfg.base_coin:
                     spot_size = _safe_float(c.get("walletBalance"))
                     break
         except Exception:  # non-fatal: treat the spot leg as absent
@@ -151,6 +162,7 @@ class CarryStrategy:
             self.entry_basis_bps = _basis_bps(mark, spot)
             # Re-verify the exchange-side stop-loss is in place after restart.
             self._set_exchange_stop_loss(mark)
+            self._entry_time = time.time()  # reset hold timer on resume
             log.info("carry_reconcile_hedged", perp=perp_size, spot=spot_size)
             return f"resumed HEDGED position (perp {perp_size}, spot {spot_size} BTC)"
         # Orphaned perp short with no hedge = NAKED SHORT (dangerous) → flatten.
@@ -233,6 +245,7 @@ class CarryStrategy:
         Updates ``self.state`` / ``self.position_qty`` as a side effect so the
         strategy is stateful across calls.
         """
+        self._poll_count += 1
         fr = self.exchange.get_funding_rate(self.cfg.symbol)
         funding = _safe_float(fr.get("fundingRate"))
         perp_price = _safe_float(fr.get("markPrice")) or _safe_float(fr.get("lastPrice"))
@@ -248,6 +261,8 @@ class CarryStrategy:
         return act
 
     def _decide_hedged(self, funding: float, basis: float) -> CarryAction:
+        # 0) Liquidation proximity warning (side-effect only — logs/alerts).
+        self._check_liq_proximity()
         # 1) Basis guard — short-squeeze liquidation protection (highest priority).
         if basis > self.cfg.basis_guard_bps:
             self.state = CarryState.FLAT
@@ -292,6 +307,19 @@ class CarryStrategy:
         else:
             # Funding positive/neutral — reset the exit confirmation counter.
             self._exit_signals = 0
+        # 2b) Max hold time — don't hold a position forever even if funding
+        #     is marginally positive. Closes after max_hold_hours (0 = off).
+        if self.cfg.max_hold_hours > 0 and self._entry_time is not None:
+            held_h = (time.time() - self._entry_time) / 3600.0
+            if held_h >= self.cfg.max_hold_hours:
+                self.state = CarryState.FLAT
+                self.position_qty = 0.0
+                return CarryAction(
+                    "close",
+                    f"max hold {held_h:.1f}h ≥ {self.cfg.max_hold_hours:.0f}h",
+                    funding_rate=funding,
+                    basis_bps=basis,
+                )
         # 3) Hedge drift — keep perp and spot notionals aligned.
         if abs(basis - self.entry_basis_bps) > self.cfg.rebalance_drift_bps:
             return CarryAction(
@@ -316,6 +344,7 @@ class CarryStrategy:
         self.state = CarryState.HEDGED
         self.position_qty = qty
         self.entry_basis_bps = basis
+        self._entry_time = time.time()
         return CarryAction(
             "open",
             f"funding {funding*100:.4f}% ≥ {self.cfg.min_funding_to_open*100:.4f}% "
@@ -420,18 +449,32 @@ class CarryStrategy:
     def _close(self, act: CarryAction) -> dict:
         qty = act.qty or self.position_qty
         log.info("carry_close", qty=qty, reason=act.reason)
-        # Buy back the perp short + sell the spot long.
+        # Buy back the perp short (reduceOnly ensures it only closes).
         perp = self.exchange.place_order({
             "symbol": self.cfg.symbol, "side": "Buy",
             "orderType": "Market", "qty": str(qty), "reduceOnly": True,
         })
-        spot = self.exchange.place_spot_order({
-            "symbol": self.cfg.symbol, "side": "Sell",
-            "orderType": "Market", "qty": str(qty),
-        })
-        # Clear the exchange-side stop-loss (position is gone).
+        # Sell the spot long.  CRITICAL: the actual spot BTC balance is
+        # slightly LESS than the perp qty because the spot taker fee (~0.1%)
+        # was deducted from the received BTC at open time.  Selling the full
+        # perp qty would FAIL (insufficient balance).  Read the real balance.
+        _, spot_size = self._leg_sizes()
+        sell_qty = spot_size if spot_size > 0 else qty
+        spot: dict | None = None
+        try:
+            spot = self.exchange.place_spot_order({
+                "symbol": self.cfg.symbol, "side": "Sell",
+                "orderType": "Market", "qty": str(round(sell_qty, 8)),
+            })
+        except Exception as exc:
+            # Perp is closed; leftover spot is not dangerous (no liquidation
+            # risk on a spot long), but log so the operator can clean up.
+            log.error("carry_close_spot_failed", error=str(exc), sell_qty=sell_qty)
+        # Clear the exchange-side stop-loss (perp position is gone).
         self._clear_exchange_stop_loss()
         self.position_qty = 0.0
+        self.entry_basis_bps = 0.0
+        self._entry_time = None
         return {"perp": perp, "spot": spot}
 
     # ------------------------------------------------------------------
@@ -463,6 +506,36 @@ class CarryStrategy:
         except Exception as exc:
             log.warning("carry_stop_loss_clear_failed", error=str(exc))
 
+    def _check_liq_proximity(self) -> None:
+        """Warn if mark price is within ``liq_warning_pct`` of liquidation.
+
+        Best-effort and throttled (every ~12 polls ≈ 1 min at 5 s interval)
+        to avoid an extra API call on every single poll.  Side-effect only —
+        logs a warning but does not change the position or decision.
+        """
+        if self.cfg.liq_warning_pct <= 0:
+            return
+        if self._poll_count % 12 != 0:
+            return
+        try:
+            for p in self.exchange.get_positions(self.cfg.symbol):
+                if p.get("symbol") != self.cfg.symbol:
+                    continue
+                liq = _safe_float(p.get("liqPrice"))
+                mark = _safe_float(p.get("markPrice"))
+                if liq > 0 and mark > 0:
+                    dist_pct = abs(mark - liq) / mark * 100.0
+                    if dist_pct < self.cfg.liq_warning_pct:
+                        log.warning(
+                            "carry_liq_proximity",
+                            liq_price=liq, mark_price=mark,
+                            dist_pct=round(dist_pct, 1),
+                            warning_pct=self.cfg.liq_warning_pct,
+                        )
+                    break
+        except Exception:
+            pass  # best-effort; never crash the decision loop
+
     def _leg_sizes(self) -> tuple[float, float]:
         """Actual ``(perp_short_size_btc, spot_long_size_btc)`` from the exchange.
 
@@ -480,9 +553,9 @@ class CarryStrategy:
             log.warning("rebalance_read_perp_failed", error=str(exc))
         spot_size = 0.0
         try:
-            res = self.exchange.get_wallet_balance("BTC")
+            res = self.exchange.get_wallet_balance(self.cfg.base_coin)
             for c in res["list"][0]["coin"]:
-                if c.get("coin") == "BTC":
+                if c.get("coin") == self.cfg.base_coin:
                     spot_size = _safe_float(c.get("walletBalance"))
                     break
         except (KeyError, IndexError, TypeError, ValueError) as exc:

@@ -214,6 +214,28 @@ class BybitExchange:
         res = self._request("get_executions", **params)
         return res.get("list", [])
 
+    def get_instrument_info(self, symbol: str, category: str = "linear") -> dict[str, Any]:
+        """Lot-size filter and precision for a symbol (linear or spot).
+
+        Returns the raw instrument dict from Bybit, which includes
+        ``lotSizeFilter`` (``qtyStep``, ``minOrderQty``, etc.).
+        """
+        res = self._request("get_instruments_info", category=category, symbol=symbol)
+        lst = res.get("list", [])
+        return lst[0] if lst else {}
+
+    def get_qty_step(self, symbol: str) -> float:
+        """Auto-detect the linear-perp lot step for *symbol* (e.g. 0.001).
+
+        Falls back to ``0.001`` if the API call fails.
+        """
+        try:
+            info = self.get_instrument_info(symbol, category="linear")
+            lot = info.get("lotSizeFilter", {})
+            return float(lot.get("qtyStep", "0.001"))
+        except Exception:
+            return 0.001
+
     def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         """Configure leverage for a linear symbol."""
         try:

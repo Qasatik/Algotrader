@@ -67,6 +67,8 @@ def main() -> None:
                     help="disable Telegram push notifications")
     ap.add_argument("--stop-loss-pct", type=float, default=15.0,
                     help="exchange-side stop-loss %% from entry (default 15%%, 0=off)")
+    ap.add_argument("--max-hold-hours", type=float, default=0.0,
+                    help="close position after this many hours (default 0=unlimited)")
     args = ap.parse_args()
 
     # Safety: require explicit confirmation for real-money mainnet trading.
@@ -96,6 +98,7 @@ def main() -> None:
         size_mult_min=args.size_mult_min,
         size_mult_max=args.size_mult_max,
         stop_loss_pct=args.stop_loss_pct,
+        max_hold_hours=args.max_hold_hours,
         paper_equity=args.paper_equity if args.dry_run else None,
         # Always log trades to CSV (local persistent history) unless dry-run.
         trade_log=None if args.dry_run else DEFAULT_TRADE_LOG,
@@ -151,6 +154,7 @@ def main() -> None:
 
     _poll_count = 0
     _consecutive_errors = 0
+    act = None  # type: ignore[assignment]  # set inside loop; guarded in heartbeat
     while _running:
         try:
             act = strat.decide()
@@ -184,9 +188,10 @@ def main() -> None:
         _poll_count += 1
         if (args.heartbeat > 0 and _poll_count % args.heartbeat == 0
                 and not args.no_notify):
+            fund_str = f"funding {act.funding_rate*100:+.4f}%" if act else "funding ?"
+            basis_str = f"basis {act.basis_bps:+.1f}bps" if act else "basis ?"
             _notify(f"💚 Heartbeat | {strat.state.value} | "
-                    f"funding {act.funding_rate*100:+.4f}% | "
-                    f"basis {act.basis_bps:+.1f}bps | poll #{_poll_count}")
+                    f"{fund_str} | {basis_str} | poll #{_poll_count}")
 
         # sleep in small increments so SIGINT is responsive
         for _ in range(args.interval):
