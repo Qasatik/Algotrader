@@ -46,6 +46,8 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="decide only, no orders")
     ap.add_argument("--mainnet", action="store_true",
                     help="LIVE REAL MONEY on mainnet (requires confirmation)")
+    ap.add_argument("--flatten-on-exit", action="store_true",
+                    help="close the carry position on shutdown (default: leave open)")
     ap.add_argument("--paper-equity", type=float, default=10000.0,
                     help="simulated USDT equity for dry-run sizing (default 10000)")
     args = ap.parse_args()
@@ -124,15 +126,21 @@ def main() -> None:
                 break
             time.sleep(1)
 
-    # graceful shutdown: flatten if still hedged
+    # graceful shutdown. By default we LEAVE the carry position open so it
+    # keeps collecting funding across restarts (the bot reconciles with the
+    # live position on next start). Only flatten when --flatten-on-exit is set.
     if strat.state.value == "hedged" and not args.dry_run:
-        print("\nFlattening open carry position on shutdown...")
-        try:
-            from core.carry_strategy import CarryAction
-            strat.execute(CarryAction("close", "shutdown"))
-        except Exception as exc:
-            log.error("shutdown_flatten_failed", error=str(exc))
-            print(f"✗ failed to flatten: {exc} — CLOSE MANUALLY")
+        if args.flatten_on_exit:
+            print("\nFlattening open carry position on shutdown (--flatten-on-exit)...")
+            try:
+                from core.carry_strategy import CarryAction
+                strat.execute(CarryAction("close", "shutdown"))
+            except Exception as exc:
+                log.error("shutdown_flatten_failed", error=str(exc))
+                print(f"✗ failed to flatten: {exc} — CLOSE MANUALLY")
+        else:
+            print("\nLeaving carry position OPEN (will resume on next start).")
+            print("  Use --flatten-on-exit to close it on shutdown.")
     exchange.close()
     print("\nDone.")
 

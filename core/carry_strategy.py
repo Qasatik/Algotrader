@@ -56,6 +56,7 @@ class CarryConfig:
     close_funding: float = -0.0001  # flatten if funding goes negative (< -0.01%)
     basis_guard_bps: float = 50.0  # flatten if perp premium > 50 bps (0.5%)
     rebalance_drift_bps: float = 20.0  # rebalance hedge if basis drifts > 20 bps
+    rebalance_min_btc: float = 0.001  # min BTC mismatch to trigger a corrective order
     qty_step: float = 0.001  # BTC lot step (round qty down to this)
     paper_equity: float | None = None  # if set, override wallet balance (dry-run)
     max_notional: float | None = None  # hard cap on position notional (USDT safety)
@@ -302,11 +303,82 @@ class CarryStrategy:
         self.position_qty = 0.0
         return {"perp": perp, "spot": spot}
 
+    def _leg_sizes(self) -> tuple[float, float]:
+        """Actual ``(perp_short_size_btc, spot_long_size_btc)`` from the exchange.
+
+        Best-effort: any leg that cannot be read returns ``0.0`` so the caller
+        can decide whether rebalancing is safe (we never want to "correct" a
+        mismatch we can't actually measure).
+        """
+        perp_size = 0.0
+        try:
+            for p in self.exchange.get_positions(self.cfg.symbol):
+                if p.get("symbol") == self.cfg.symbol:
+                    perp_size = abs(_safe_float(p.get("size")))
+                    break
+        except Exception as exc:  # network / parse — don't let it crash the loop
+            log.warning("rebalance_read_perp_failed", error=str(exc))
+        spot_size = 0.0
+        try:
+            res = self.exchange.get_wallet_balance("BTC")
+            for c in res["list"][0]["coin"]:
+                if c.get("coin") == "BTC":
+                    spot_size = _safe_float(c.get("walletBalance"))
+                    break
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            log.warning("rebalance_read_spot_failed", error=str(exc))
+        return perp_size, spot_size
+
     def _rebalance(self, act: CarryAction) -> dict:
+        """Re-align the perp and spot legs so the position stays delta-neutral.
+
+        Reads the *actual* leg sizes from the exchange; if they diverge by more
+        than ``rebalance_min_btc``, places a corrective order on the **spot**
+        leg (cheaper to adjust, and leaves the funding-collecting perp alone):
+
+        * net short (perp > spot) → BUY more spot (qty in **USDT**)
+        * net long  (spot > perp) → SELL spot     (qty in **BTC**)
+
+        The basis baseline is always reset afterwards, so a no-op rebalance
+        (mismatch below threshold) doesn't re-trigger on every poll.
+        """
         log.info("carry_rebalance", reason=act.reason, basis_bps=act.basis_bps)
-        # In production: compute the delta between perp and spot notionals and
-        # trim/augment the smaller leg. Stubbed here — returns current state.
-        return {"rebalanced": True, "basis_bps": act.basis_bps}
+        perp_size, spot_size = self._leg_sizes()
+        delta = perp_size - spot_size  # >0 net short, <0 net long
+        price = act.spot_price or act.perp_price
+        result: dict = {
+            "rebalanced": False, "perp_size": perp_size,
+            "spot_size": spot_size, "delta_btc": delta,
+        }
+        if abs(delta) < self.cfg.rebalance_min_btc or price <= 0:
+            log.info(
+                "carry_rebalance_skipped", delta_btc=delta,
+                min_btc=self.cfg.rebalance_min_btc,
+            )
+            self.entry_basis_bps = act.basis_bps
+            return result
+        try:
+            if delta > 0:
+                # Net short → top up the spot long. Spot Market BUY qty is USDT.
+                qty_usdt = round(delta * price, 2)
+                self.exchange.place_spot_order({
+                    "symbol": self.cfg.symbol, "side": "Buy",
+                    "orderType": "Market", "qty": str(qty_usdt),
+                })
+                log.info("carry_rebalance_buy_spot", qty_usdt=qty_usdt, delta_btc=delta)
+            else:
+                # Net long → trim the spot long. Spot Market SELL qty is BTC.
+                qty_btc = round(abs(delta), 8)
+                self.exchange.place_spot_order({
+                    "symbol": self.cfg.symbol, "side": "Sell",
+                    "orderType": "Market", "qty": str(qty_btc),
+                })
+                log.info("carry_rebalance_sell_spot", qty_btc=qty_btc, delta_btc=delta)
+            result["rebalanced"] = True
+        except Exception as exc:
+            log.error("carry_rebalance_failed", error=str(exc))
+        self.entry_basis_bps = act.basis_bps
+        return result
 
     # ------------------------------------------------------------------
     # Convenience

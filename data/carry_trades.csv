@@ -1,0 +1,2 @@
+timestamp,action,symbol,side,qty,funding_rate,basis_bps,perp_price,spot_price,reason
+2026-07-15T21:01:28+00:00,open,BTCUSDT,Sell,0.001,7.132e-05,-4.03123437319646,64966.3,64992.5,funding 0.0071% ≥ 0.0050%

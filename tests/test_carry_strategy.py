@@ -5,10 +5,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.carry_strategy import CarryConfig, CarryState, CarryStrategy
+from core.carry_strategy import CarryAction, CarryConfig, CarryState, CarryStrategy
 
 
-def _mock_exchange(funding=0.0002, perp=65000.0, spot=65000.0, equity=10000.0):
+def _mock_exchange(funding=0.0002, perp=65000.0, spot=65000.0, equity=10000.0,
+                   perp_size=0.0, spot_btc=0.0):
     ex = MagicMock()
     ex.get_funding_rate.return_value = {
         "fundingRate": str(funding),
@@ -17,8 +18,15 @@ def _mock_exchange(funding=0.0002, perp=65000.0, spot=65000.0, equity=10000.0):
     }
     ex.get_spot_price.return_value = spot
     ex.get_wallet_balance.return_value = {
-        "list": [{"coin": [{"coin": "USDT", "walletBalance": str(equity)}]}]
+        "list": [{"coin": [
+            {"coin": "USDT", "walletBalance": str(equity)},
+            {"coin": "BTC", "walletBalance": str(spot_btc)},
+        ]}]
     }
+    ex.get_positions.return_value = (
+        [{"symbol": "BTCUSDT", "size": str(perp_size), "side": "Sell"}]
+        if perp_size else []
+    )
     ex.place_order.return_value = {"orderId": "perp-1"}
     ex.place_spot_order.return_value = {"orderId": "spot-1"}
     return ex
@@ -116,6 +124,47 @@ def test_rebalance_on_hedge_drift():
     act = s.decide()
     assert act.action == "rebalance"
     assert s.state == CarryState.HEDGED  # stays hedged
+
+
+def test_rebalance_buys_spot_when_net_short():
+    """Perp short larger than spot long → buy more spot (USDT qty)."""
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.002, spot_btc=0.001)
+    s = CarryStrategy(ex, CarryConfig(rebalance_min_btc=0.001, basis_guard_bps=200.0))
+    act = CarryAction("rebalance", "drift", spot_price=65000.0, perp_price=65000.0)
+    res = s._rebalance(act)
+    assert res["rebalanced"] is True
+    ex.place_spot_order.assert_called_once()
+    order = ex.place_spot_order.call_args.args[0]
+    assert order["side"] == "Buy"
+    # delta = 0.001 BTC × 65000 = 65.0 USDT
+    assert float(order["qty"]) == 65.0
+
+
+def test_rebalance_sells_spot_when_net_long():
+    """Spot long larger than perp short → sell spot (BTC qty)."""
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.001, spot_btc=0.002)
+    s = CarryStrategy(ex, CarryConfig(rebalance_min_btc=0.001, basis_guard_bps=200.0))
+    act = CarryAction("rebalance", "drift", spot_price=65000.0, perp_price=65000.0)
+    res = s._rebalance(act)
+    assert res["rebalanced"] is True
+    ex.place_spot_order.assert_called_once()
+    order = ex.place_spot_order.call_args.args[0]
+    assert order["side"] == "Sell"
+    # delta = 0.001 BTC, sell qty in BTC
+    assert float(order["qty"]) == 0.001
+
+
+def test_rebalance_skips_when_within_tolerance():
+    """Mismatch below rebalance_min_btc → no order, baseline still reset."""
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.001, spot_btc=0.001)
+    s = CarryStrategy(ex, CarryConfig(rebalance_min_btc=0.001, basis_guard_bps=200.0))
+    s.entry_basis_bps = 0.0
+    act = CarryAction("rebalance", "drift", basis_bps=30.0,
+                      spot_price=65000.0, perp_price=65000.0)
+    res = s._rebalance(act)
+    assert res["rebalanced"] is False
+    ex.place_spot_order.assert_not_called()
+    assert s.entry_basis_bps == 30.0  # baseline reset even on no-op
 
 
 # ---------------- execution --------------------
