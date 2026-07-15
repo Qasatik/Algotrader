@@ -1,0 +1,33 @@
+# Bybit official SDK (V5 unified trading account)
+pybit==5.9.0
+
+# Async / networking
+aiohttp==3.10.11
+websockets==12.0
+tenacity==8.5.0
+
+# ML / GPU inference
+torch==2.3.1
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+pyarrow==17.0.0
+
+# Config & utilities
+python-dotenv==1.0.1
+pydantic==2.8.2
+PyYAML==6.0.1
+
+# Observability
+structlog==24.2.0
+prometheus-client==0.20.0
+
+# Telegram admin bot
+python-telegram-bot==21.4
+qrcode==7.4.2
+Pillow==10.4.0
+
+# Testing / linting (dev)
+pytest==8.3.2
+pytest-asyncio==0.23.8
+ruff==0.5.6

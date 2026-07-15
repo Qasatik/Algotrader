@@ -1,0 +1,23 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["models", ".env"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "C4"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N802", "N803"]
+# Uppercase X is the universal ML convention for feature matrices
+"ml/*" = ["N803", "N806"]
+"backtest/*" = ["N803", "N806"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

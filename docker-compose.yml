@@ -1,0 +1,61 @@
+# =====================================================================
+#  Bybit Algo Trading Bot - GPU compose stack
+#  Usage:  cp .env.example .env  &&  fill values  &&  docker compose up -d
+# =====================================================================
+services:
+  bot:
+    build: .
+    image: bybit-algo-bot:latest
+    container_name: bybit-algo-bot
+    restart: unless-stopped
+    # NVIDIA GPU passthrough (requires nvidia-container-toolkit on host)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    env_file:
+      - .env
+    ports:
+      - "9090:9090"          # Prometheus /metrics
+    volumes:
+      # Persist trained model checkpoint outside the container
+      - ./models:/app/models:ro
+      # Persist logs if you add a log volume
+      - ./logs:/app/logs
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---- Observability (optional but recommended) ---------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    networks:
+      - trading-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    ports:
+      - "3000:3000"
+    networks:
+      - trading-net
+
+networks:
+  trading-net:
+    driver: bridge

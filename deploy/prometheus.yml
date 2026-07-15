@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "bybit-algo-bot"
+    static_configs:
+      - targets: ["bot:9090"]

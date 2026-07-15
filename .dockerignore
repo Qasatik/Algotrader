@@ -1,0 +1,20 @@
+# Keep the Docker build context lean (faster builds, smaller cache invalidation)
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+data
+models/*.pt
+models/*.pth
+*.parquet
+logs
+.env
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
