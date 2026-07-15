@@ -25,6 +25,7 @@ models/*.pt
 models/*.pth
 *.ckpt
 data/*.parquet
+data/*.json
 wandb/
 
 # ---- IDE / OS ------------------------------------------------------
