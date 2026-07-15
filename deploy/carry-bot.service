@@ -1,0 +1,55 @@
+# Bybit delta-neutral funding carry bot — systemd service unit (LIVE mainnet)
+#
+# Install (system service, auto-starts on boot):
+#   sudo cp deploy/carry-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now carry-bot
+#
+# View live logs (journald):
+#   journalctl -u carry-bot -f
+#
+# Manage:
+#   sudo systemctl status  carry-bot
+#   sudo systemctl restart carry-bot
+#   sudo systemctl stop    carry-bot      # leaves the carry position OPEN
+#   sudo systemctl disable --now carry-bot
+#
+# NOTE: this runs REAL-MONEY trading. Edit ExecStart params below to match
+# your risk settings (min-funding, max-notional, leverage, equity-fraction).
+# The position is LEFT OPEN on stop (no --flatten-on-exit) so it keeps
+# collecting funding across restarts.
+
+[Unit]
+Description=Bybit delta-neutral funding carry bot (LIVE mainnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pepe
+Group=pepe
+WorkingDirectory=/home/pepe/bybit-algo-bot
+Environment=PYTHONPATH=.
+
+ExecStart=/usr/bin/python3 scripts/run_carry_testnet.py \
+    --mainnet --yes \
+    --min-funding 0.00005 \
+    --max-notional 70 \
+    --leverage 2 \
+    --equity-fraction 0.7
+
+# Resilience: restart on any crash / reboot, after a short back-off.
+Restart=always
+RestartSec=10
+
+# Send SIGINT (not the default SIGTERM) so the runner's graceful-shutdown
+# handler runs. The poll loop checks the flag every ~1s, so 20s is plenty.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Journald captures stdout/stderr automatically; keep them unbuffered so
+# logs appear promptly.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

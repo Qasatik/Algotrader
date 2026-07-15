@@ -40,7 +40,7 @@ def main() -> None:
     ap.add_argument("--equity-fraction", type=float, default=0.5)
     ap.add_argument("--basis-guard-bps", type=float, default=50.0)
     ap.add_argument("--min-funding", type=float, default=0.0001,
-                    help="open when funding >= this (default 0.01%)")
+                    help="open when funding >= this (default 0.01%%)")
     ap.add_argument("--max-notional", type=float, default=None,
                     help="hard cap on position notional USDT (real-money safety)")
     ap.add_argument("--dry-run", action="store_true", help="decide only, no orders")
@@ -48,12 +48,15 @@ def main() -> None:
                     help="LIVE REAL MONEY on mainnet (requires confirmation)")
     ap.add_argument("--flatten-on-exit", action="store_true",
                     help="close the carry position on shutdown (default: leave open)")
+    ap.add_argument("--yes", action="store_true",
+                    help="skip the interactive mainnet confirmation (for systemd/automation)")
     ap.add_argument("--paper-equity", type=float, default=10000.0,
                     help="simulated USDT equity for dry-run sizing (default 10000)")
     args = ap.parse_args()
 
     # Safety: require explicit confirmation for real-money mainnet trading.
-    if args.mainnet and not args.dry_run:
+    # --yes bypasses the prompt for automated / systemd runs.
+    if args.mainnet and not args.dry_run and not args.yes:
         print("\n" + "!" * 64)
         print("  ⚠️  REAL MONEY — MAINNET LIVE TRADING  ⚠️")
         print("  This will place REAL orders with REAL funds on bybit.com.")
