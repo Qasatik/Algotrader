@@ -19,13 +19,23 @@ mock exchange. ``execute()`` turns an action into real orders.
 """
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 from core.exchange import BybitExchange
 from utils.logger import get_logger
 
 log = get_logger("carry_strategy")
+
+# Default location for the persistent trade log (CSV).
+DEFAULT_TRADE_LOG = "data/carry_trades.csv"
+TRADE_LOG_FIELDS = [
+    "timestamp", "action", "symbol", "side", "qty", "funding_rate",
+    "basis_bps", "perp_price", "spot_price", "reason",
+]
 
 
 class CarryState(str, Enum):
@@ -49,6 +59,7 @@ class CarryConfig:
     qty_step: float = 0.001  # BTC lot step (round qty down to this)
     paper_equity: float | None = None  # if set, override wallet balance (dry-run)
     max_notional: float | None = None  # hard cap on position notional (USDT safety)
+    trade_log: str | None = None  # CSV path for persistent trade history (None=off)
 
 
 @dataclass
@@ -62,6 +73,8 @@ class CarryAction:
     qty: float = 0.0
     funding_rate: float = 0.0
     basis_bps: float = 0.0
+    perp_price: float = 0.0
+    spot_price: float = 0.0
 
 
 def _basis_bps(perp_price: float, spot_price: float) -> float:
@@ -127,8 +140,12 @@ class CarryStrategy:
         basis = _basis_bps(perp_price, spot_price)
 
         if self.state == CarryState.HEDGED:
-            return self._decide_hedged(funding, basis)
-        return self._decide_flat(funding, basis, perp_price or spot_price)
+            act = self._decide_hedged(funding, basis)
+        else:
+            act = self._decide_flat(funding, basis, perp_price or spot_price)
+        act.perp_price = perp_price
+        act.spot_price = spot_price
+        return act
 
     def _decide_hedged(self, funding: float, basis: float) -> CarryAction:
         # 1) Basis guard — short-squeeze liquidation protection (highest priority).
@@ -189,13 +206,45 @@ class CarryStrategy:
     # ------------------------------------------------------------------
     def execute(self, act: CarryAction) -> dict | None:
         """Turn a CarryAction into exchange orders. Returns the open result."""
+        result: dict | None = None
         if act.action == "open":
-            return self._open(act)
-        if act.action == "close":
-            return self._close()
-        if act.action == "rebalance":
-            return self._rebalance(act)
-        return None
+            result = self._open(act)
+        elif act.action == "close":
+            result = self._close(act)
+        elif act.action == "rebalance":
+            result = self._rebalance(act)
+        if result is not None:
+            self._log_trade(act)
+        return result
+
+    def _log_trade(self, act: CarryAction) -> None:
+        """Append a row to the persistent CSV trade log (if enabled)."""
+        path = self.cfg.trade_log
+        if not path:
+            return
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not p.exists()
+            row = {
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "action": act.action,
+                "symbol": self.cfg.symbol,
+                "side": act.perp_side or "",
+                "qty": act.qty,
+                "funding_rate": act.funding_rate,
+                "basis_bps": act.basis_bps,
+                "perp_price": act.perp_price,
+                "spot_price": act.spot_price,
+                "reason": act.reason,
+            }
+            with open(p, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
+                if write_header:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as exc:
+            log.warning("trade_log_write_failed", error=str(exc))
 
     def _open(self, act: CarryAction) -> dict:
         log.info(
@@ -214,9 +263,9 @@ class CarryStrategy:
         })
         return {"perp": perp, "spot": spot}
 
-    def _close(self) -> dict:
-        qty = self.position_qty
-        log.info("carry_close", qty=qty)
+    def _close(self, act: CarryAction) -> dict:
+        qty = act.qty or self.position_qty
+        log.info("carry_close", qty=qty, reason=act.reason)
         # Buy back the perp short + sell the spot long.
         perp = self.exchange.place_order({
             "symbol": self.cfg.symbol, "side": "Buy",

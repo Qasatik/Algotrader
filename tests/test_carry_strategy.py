@@ -1,4 +1,6 @@
 """Tests for the live delta-neutral CarryStrategy (state machine + basis guard)."""
+import csv
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from core.carry_strategy import CarryConfig, CarryState, CarryStrategy
@@ -135,3 +137,43 @@ def test_run_once_decides_and_executes():
     act = s.run_once()
     assert act.action == "open"
     assert ex.place_order.called
+
+
+# ---------------- trade logging --------------------
+
+def test_trade_log_written_on_open(tmp_path: Path):
+    log_path = str(tmp_path / "trades.csv")
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001, trade_log=log_path))
+    s.run_once()
+    assert Path(log_path).exists()
+    with open(log_path) as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["action"] == "open"
+    assert float(rows[0]["funding_rate"]) == 0.0003
+    assert float(rows[0]["perp_price"]) == 65000.0
+
+
+def test_no_trade_log_when_disabled(tmp_path: Path):
+    log_path = str(tmp_path / "trades.csv")
+    ex = _mock_exchange(funding=0.0003)
+    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
+    s.run_once()
+    assert not Path(log_path).exists()
+
+
+def test_trade_log_close_appends_row(tmp_path: Path):
+    log_path = str(tmp_path / "trades.csv")
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001, trade_log=log_path))
+    s.run_once()
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "-0.0002", "markPrice": "65000", "lastPrice": "65000"
+    }
+    s.run_once()
+    with open(log_path) as f:
+        rows = list(csv.DictReader(f))
+    actions = [r["action"] for r in rows]
+    assert "open" in actions
+    assert "close" in actions

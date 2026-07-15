@@ -16,6 +16,8 @@ Commands:
   /status       - engine state, equity, buffer, stats (read-only)
   /positions    - open positions (read-only)
   /pnl          - realized + unrealized PnL (read-only)
+  /stats        - carry trade stats by day/month/year (read-only)
+  /trades       - recent carry trades from the log (read-only)
   /start_engine - start trading  [2FA]
   /stop_engine  - graceful stop  [2FA]
   /pause        - pause order placement  [2FA]
@@ -24,9 +26,11 @@ Commands:
 """
 from __future__ import annotations
 
+import csv as _csv
 import io
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -39,6 +43,8 @@ from telegram.ext import (
 
 from bot.alerts import set_alert_sender
 from config.settings import get_settings
+from core.carry_stats import format_stats, load_stats
+from core.carry_strategy import DEFAULT_TRADE_LOG
 from core.engine import TradingEngine
 from security.totp import generate_secret, provisioning_uri, verify
 from utils.logger import get_logger
@@ -120,6 +126,8 @@ class TelegramAdminBot:
         add(CommandHandler("status", self._cmd_status))
         add(CommandHandler("positions", self._cmd_positions))
         add(CommandHandler("pnl", self._cmd_pnl))
+        add(CommandHandler("stats", self._cmd_stats))
+        add(CommandHandler("trades", self._cmd_trades))
         # privileged (2FA)
         add(CommandHandler("start_engine", self._cmd_start_engine))
         add(CommandHandler("stop_engine", self._cmd_stop_engine))
@@ -146,7 +154,9 @@ class TelegramAdminBot:
             "🔓 /auth `<6-digit>` — unlock privileged commands\n\n"
             "👁 /status — engine state & equity\n"
             "👁 /positions — open positions\n"
-            "👁 /pnl — profit & loss\n\n"
+            "👁 /pnl — profit & loss\n"
+            "👁 /stats `[day|month|year]` — carry trade stats\n"
+            "👁 /trades — recent carry trades\n\n"
             "⚙️ /start_engine — start trading `[2FA]`\n"
             "⚙️ /stop_engine — graceful stop `[2FA]`\n"
             "⚙️ /pause — pause orders `[2FA]`\n"
@@ -246,6 +256,44 @@ class TelegramAdminBot:
             f"Unrealized PnL: `{round(total_upnl, 2)} USDT`\n"
             f"Equity: `{st['equity_usdt']} USDT`",
             parse_mode=ParseMode.MARKDOWN,
+        )
+
+    async def _cmd_stats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Carry trade stats grouped by day/month/year.
+
+        Usage: /stats [day|month|year]  (default: day)
+        """
+        if not self._is_admin(update):
+            return
+        period = (ctx.args[0].lower() if ctx.args else "day")
+        if period not in ("day", "month", "year"):
+            period = "day"
+        stats = load_stats(period)
+        text = format_stats(period, stats)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_trades(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show recent carry trades from the local CSV log."""
+        if not self._is_admin(update):
+            return
+        p = Path(DEFAULT_TRADE_LOG)
+        if not p.exists():
+            return await update.message.reply_text("No trades logged yet.")
+        rows: list[dict] = []
+        with open(p, newline="") as f:
+            rows = list(_csv.DictReader(f))
+        if not rows:
+            return await update.message.reply_text("Trade log is empty.")
+        lines = ["📋 *Recent Carry Trades*\n"]
+        for r in rows[-10:]:
+            ts = r.get("timestamp", "")[:16].replace("T", " ")
+            fund = float(r.get("funding_rate", 0)) * 100
+            lines.append(
+                f"`{ts}` {r['action']:<8} fund={fund:+.4f}% "
+                f"basis={float(r.get('basis_bps', 0)):+.1f}bps\n  {r.get('reason', '')}"
+            )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
 
     # ---- privileged commands (require 2FA) -------------------------

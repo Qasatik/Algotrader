@@ -17,7 +17,7 @@ import argparse
 import signal
 import time
 
-from core.carry_strategy import CarryConfig, CarryStrategy
+from core.carry_strategy import DEFAULT_TRADE_LOG, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
 from utils.logger import get_logger
 
@@ -73,6 +73,8 @@ def main() -> None:
         min_funding_to_open=args.min_funding,
         max_notional=args.max_notional,
         paper_equity=args.paper_equity if args.dry_run else None,
+        # Always log trades to CSV (local persistent history) unless dry-run.
+        trade_log=None if args.dry_run else DEFAULT_TRADE_LOG,
     )
     if args.dry_run:
         # Dry-run reads PUBLIC mainnet data (real funding rates, no keys needed).

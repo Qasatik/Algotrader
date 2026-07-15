@@ -167,6 +167,48 @@ class BybitExchange:
         )
         return res.get("list", [])
 
+    def get_closed_pnl(
+        self, symbol: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Closed-position PnL records (realised profit/loss history).
+
+        Each record has: symbol, closedPnl, execQty, avgEntryPrice,
+        avgExitPrice, createdTime, updatedTime, etc.
+        """
+        params: dict[str, Any] = {"category": "linear", "limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        res = self._request("get_closed_pnl", **params)
+        return res.get("list", [])
+
+    def get_order_history(
+        self, symbol: str | None = None, limit: int = 50, category: str = "linear"
+    ) -> list[dict[str, Any]]:
+        """Historical orders (filled, cancelled, etc.).
+
+        Each record has: orderId, symbol, side, orderType, qty, cumExecQty,
+        avgPrice, status, createdTime, etc.
+        """
+        params: dict[str, Any] = {"category": category, "limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        res = self._request("get_order_history", **params)
+        return res.get("list", [])
+
+    def get_executions(
+        self, symbol: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Trade execution records (every individual fill).
+
+        Each record has: execId, symbol, side, execPrice, execQty,
+        execFee, execType, tradeTime, etc.
+        """
+        params: dict[str, Any] = {"category": "linear", "limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        res = self._request("get_executions", **params)
+        return res.get("list", [])
+
     def set_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         """Configure leverage for a linear symbol."""
         try:
