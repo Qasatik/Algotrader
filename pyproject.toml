@@ -12,6 +12,7 @@ ignore = ["E501"]  # line length handled by formatter
 # Uppercase X is the universal ML convention for feature matrices
 "ml/*" = ["N803", "N806"]
 "backtest/*" = ["N803", "N806"]
+"scripts/*" = ["N803", "N806"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
