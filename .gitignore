@@ -33,3 +33,4 @@ wandb/
 .idea/
 *.swp
 .DS_Store
+logs/
