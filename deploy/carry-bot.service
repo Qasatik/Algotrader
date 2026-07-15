@@ -33,6 +33,7 @@ Environment=PYTHONPATH=.
 
 ExecStart=/usr/bin/python3 scripts/run_carry_testnet.py \
     --mainnet --yes \
+    --interval 10 \
     --min-funding 0.00005 \
     --max-notional 70 \
     --leverage 2 \

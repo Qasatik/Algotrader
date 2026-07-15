@@ -35,7 +35,8 @@ def _handle_sigint(_sig, _frame) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Live funding carry runner")
     ap.add_argument("--symbol", default="BTCUSDT")
-    ap.add_argument("--interval", type=int, default=300, help="poll seconds (default 300)")
+    ap.add_argument("--interval", type=int, default=60,
+                    help="poll seconds (default 60; use ~5-10 for fast basis-guard reaction)")
     ap.add_argument("--leverage", type=int, default=2)
     ap.add_argument("--equity-fraction", type=float, default=0.5)
     ap.add_argument("--basis-guard-bps", type=float, default=50.0)
