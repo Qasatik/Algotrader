@@ -1,0 +1,28 @@
+{"symbol": "BTCUSDT", "side": "Buy", "qty": 0.5, "entry": 50000.0, "sl": 49800.0, "tp": 50400.0, "risk_usdt": 100.0, "equity": 10000.0, "event": "trade_approved", "level": "info", "timestamp": "2026-07-15T22:42:05.479554Z"}
+{"symbol": "BTCUSDT", "reason": "daily drawdown 4.0% >= limit 3.0%", "event": "breaker_halted_trading", "level": "warning", "timestamp": "2026-07-15T22:42:05.479822Z"}
+{"symbol": "BTCUSDT", "losses": 3, "event": "breaker_consecutive_losses", "level": "warning", "timestamp": "2026-07-15T22:42:05.481530Z"}
+{"symbol": "BTCUSDT", "reason": "cooldown (60.0m left)", "event": "breaker_halted_trading", "level": "warning", "timestamp": "2026-07-15T22:42:05.482187Z"}
+{"reason": "drift", "basis_bps": 0.0, "event": "carry_rebalance", "level": "info", "timestamp": "2026-07-15T22:42:05.599260Z"}
+{"qty_usdt": 65.0, "delta_btc": 0.001, "event": "carry_rebalance_buy_spot", "level": "info", "timestamp": "2026-07-15T22:42:05.599708Z"}
+{"reason": "drift", "basis_bps": 0.0, "event": "carry_rebalance", "level": "info", "timestamp": "2026-07-15T22:42:05.602929Z"}
+{"qty_btc": 0.001, "delta_btc": -0.001, "event": "carry_rebalance_sell_spot", "level": "info", "timestamp": "2026-07-15T22:42:05.603369Z"}
+{"reason": "drift", "basis_bps": 30.0, "event": "carry_rebalance", "level": "info", "timestamp": "2026-07-15T22:42:05.605539Z"}
+{"delta_btc": 0.0, "min_btc": 0.001, "event": "carry_rebalance_skipped", "level": "info", "timestamp": "2026-07-15T22:42:05.605749Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.076, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.608350Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.096, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.611375Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.096, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.614478Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.096, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.617565Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.096, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.621398Z"}
+{"qty": 0.0, "reason": "EV exit: hold-loss 40bps > close-cost 31bps (1\u00d7 confirmed)", "event": "carry_close", "level": "info", "timestamp": "2026-07-15T22:42:05.622104Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.096, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.624918Z"}
+{"error": "spot failed", "event": "carry_open_spot_failed", "level": "error", "timestamp": "2026-07-15T22:42:05.625272Z"}
+{"qty": 0.096, "event": "carry_open_rolled_back", "level": "warning", "timestamp": "2026-07-15T22:42:05.625492Z"}
+{"reason": "funding 0.0300% \u2265 0.0100% (conf 100%)", "qty": 0.076, "funding": 0.0003, "basis_bps": 0.0, "event": "carry_open", "level": "info", "timestamp": "2026-07-15T22:42:05.634950Z"}
+{"perp": 0.001, "spot": 0.001, "event": "carry_reconcile_hedged", "level": "info", "timestamp": "2026-07-15T22:42:05.638386Z"}
+{"event": "carry_reconcile_flat", "level": "info", "timestamp": "2026-07-15T22:42:05.640851Z"}
+{"perp_size": 0.001, "spot_size": 0.0, "event": "carry_reconcile_orphan_perp", "level": "error", "timestamp": "2026-07-15T22:42:05.643239Z"}
+{"qty": 0.001, "event": "carry_open_rolled_back", "level": "warning", "timestamp": "2026-07-15T22:42:05.643653Z"}
+{"error": "api down", "event": "carry_reconcile_read_failed", "level": "error", "timestamp": "2026-07-15T22:42:05.646452Z"}
+{"symbol": "BTCUSDT", "side": "Buy", "qty": 0.5, "entry": 50000.0, "sl": 49800.0, "tp": 50400.0, "risk_usdt": 100.0, "equity": 10000.0, "event": "trade_approved", "level": "info", "timestamp": "2026-07-15T22:42:05.668961Z"}
+{"symbol": "BTCUSDT", "count": 3, "event": "max_positions_reached", "level": "info", "timestamp": "2026-07-15T22:42:05.671987Z"}
+{"symbol": "BTCUSDT", "event": "no_equity_skip", "level": "warning", "timestamp": "2026-07-15T22:42:05.675579Z"}

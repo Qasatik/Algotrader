@@ -20,6 +20,8 @@ import time
 from core.carry_strategy import DEFAULT_TRADE_LOG, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
 from utils.logger import get_logger
+from utils.notifier import is_configured as _tg_configured
+from utils.notifier import notify as _notify
 
 log = get_logger("carry_runner")
 
@@ -59,6 +61,10 @@ def main() -> None:
                     help="size multiplier at zero confidence (default 0.75)")
     ap.add_argument("--size-mult-max", type=float, default=1.25,
                     help="size multiplier at full confidence (default 1.25)")
+    ap.add_argument("--heartbeat", type=int, default=720,
+                    help="polls between heartbeat Telegram messages (default 720 ≈ 1h at 5s)")
+    ap.add_argument("--no-notify", action="store_true",
+                    help="disable Telegram push notifications")
     args = ap.parse_args()
 
     # Safety: require explicit confirmation for real-money mainnet trading.
@@ -126,13 +132,22 @@ def main() -> None:
         equity_fraction=args.equity_fraction, mode=mode,
         basis_guard_bps=args.basis_guard_bps, min_funding=args.min_funding,
     )
+    tg = "ON" if (_tg_configured() and not args.no_notify) else "OFF"
     print(f"\n{'=' * 60}")
     print(f"  CARRY RUNNER  | {args.symbol} | {mode}")
     print(f"  leverage {args.leverage}x | equity {args.equity_fraction:.0%} | "
           f"min funding {args.min_funding*100:.3f}% | "
-          f"basis guard {args.basis_guard_bps:.0f}bps | poll {args.interval}s")
+          f"basis guard {args.basis_guard_bps:.0f}bps | poll {args.interval}s | "
+          f"telegram {tg}")
     print(f"{'=' * 60}\n")
 
+    # Push startup notification
+    if not args.no_notify:
+        _notify(f"🤖 Carry bot started | {mode} | {args.symbol} | "
+                f"poll {args.interval}s | state {strat.state.value}")
+
+    _poll_count = 0
+    _consecutive_errors = 0
     while _running:
         try:
             act = strat.decide()
@@ -141,9 +156,35 @@ def main() -> None:
                   f"basis={act.basis_bps:+6.1f}bps  {act.reason}")
             if not args.dry_run:
                 strat.execute(act)
+            _consecutive_errors = 0
+            # Push notifications on significant events
+            if not args.no_notify:
+                if act.action == "open":
+                    _notify(f"🟢 OPENED carry {act.qty:.4f} BTC | "
+                            f"funding {act.funding_rate*100:+.4f}% | "
+                            f"basis {act.basis_bps:+.1f}bps | {act.reason}")
+                elif act.action == "close":
+                    _notify(f"🔴 CLOSED carry | {act.reason} | "
+                            f"funding {act.funding_rate*100:+.4f}%")
+                elif act.action == "rebalance":
+                    _notify(f"⚖️ Rebalanced | {act.reason} | "
+                            f"basis {act.basis_bps:+.1f}bps")
         except Exception as exc:  # never let one bad poll kill the loop
             log.error("poll_failed", error=str(exc))
             print(f"✗ poll error: {exc}")
+            _consecutive_errors += 1
+            # Alert after 5 consecutive failures (≈25s at 5s interval)
+            if _consecutive_errors == 5 and not args.no_notify:
+                _notify(f"⚠️ Carry bot: 5 consecutive poll errors — last: {exc}")
+
+        # Heartbeat: every N polls, push a status line
+        _poll_count += 1
+        if (args.heartbeat > 0 and _poll_count % args.heartbeat == 0
+                and not args.no_notify):
+            _notify(f"💚 Heartbeat | {strat.state.value} | "
+                    f"funding {act.funding_rate*100:+.4f}% | "
+                    f"basis {act.basis_bps:+.1f}bps | poll #{_poll_count}")
+
         # sleep in small increments so SIGINT is responsive
         for _ in range(args.interval):
             if not _running:
@@ -156,15 +197,24 @@ def main() -> None:
     if strat.state.value == "hedged" and not args.dry_run:
         if args.flatten_on_exit:
             print("\nFlattening open carry position on shutdown (--flatten-on-exit)...")
+            if not args.no_notify:
+                _notify("🛑 Carry bot stopping — flattening position...")
             try:
                 from core.carry_strategy import CarryAction
                 strat.execute(CarryAction("close", "shutdown"))
             except Exception as exc:
                 log.error("shutdown_flatten_failed", error=str(exc))
                 print(f"✗ failed to flatten: {exc} — CLOSE MANUALLY")
+                if not args.no_notify:
+                    _notify(f"🚨 FAILED to flatten on shutdown — CLOSE MANUALLY: {exc}")
         else:
             print("\nLeaving carry position OPEN (will resume on next start).")
             print("  Use --flatten-on-exit to close it on shutdown.")
+            if not args.no_notify:
+                _notify("🛑 Carry bot stopping — position left OPEN (will resume)")
+    else:
+        if not args.no_notify:
+            _notify("🛑 Carry bot stopped (was FLAT)")
     exchange.close()
     print("\nDone.")
 
