@@ -93,17 +93,51 @@ Net realistic expectation after rebalancing + tail-risk buffer:
 - For the "double the deposit, save half in BTC" goal: a delta-neutral carry
   sleeve earning ~5%/yr with low drawdown is a reasonable **stable-yield
   component**, while BTC holdings provide the directional upside.
-- Next steps if pursuing live: (1) paper-trade the passive carry on Bybit
-  testnet to validate fills/funding settlement, (2) add a basis-risk guard that
-  flattens on extreme perp-spot divergence, (3) size conservatively (≤2× lev).
+- ✅ Built: a live [`CarryStrategy`](core/carry_strategy.py) with a basis-blowout
+  guard (flattens on perp premium > 50 bps), negative-funding exit, hedge-drift
+  rebalance, and conservative sizing (≤2× leverage). Run it on **testnet** — see
+  the "Live testnet run" section below.
 
 ---
 
-## Reproduce
+## Live testnet run
+
+The live strategy is in [`core/carry_strategy.py`](core/carry_strategy.py) and is
+driven by [`scripts/run_carry_testnet.py`](scripts/run_carry_testnet.py). It runs
+on the **Bybit demo/testnet** by default (no real money).
+
+**1. Set testnet API keys** in `.env` (get them at https://testnet.bybit.com):
+```
+BYBIT_API_KEY=...        # testnet key
+BYBIT_API_SECRET=...     # testnet secret
+PAPER_MODE=true
+```
+
+**2. Dry-run first** (decisions only, no orders):
+```bash
+PYTHONPATH=. python3 scripts/run_carry_testnet.py --dry-run --interval 60
+```
+You'll see one line per poll: `· [none     ] funding=+0.0100% basis=+2.0bps ...`
+
+**3. Live on testnet** (places real demo orders):
+```bash
+PYTHONPATH=. python3 scripts/run_carry_testnet.py --interval 300
+```
+Tune risk: `--leverage 2 --equity-fraction 0.5 --basis-guard-bps 50`.
+
+**What to validate on testnet before going live:**
+- Both legs fill (perp short + spot long) and net delta ≈ 0.
+- Funding actually settles to the short-perp side every 8h.
+- The basis guard triggers and flattens cleanly (test by watching a volatile period).
+- Graceful shutdown (`Ctrl+C`) flattens any open position.
+
+---
+
+## Reproduce (backtest)
 
 ```bash
 PYTHONPATH=. python3 scripts/download_funding.py --symbol BTCUSDT --days 1500
 PYTHONPATH=. python3 scripts/backtest_carry.py --symbol BTCUSDT
 ```
 
-Tests: `PYTHONPATH=. python3 -m pytest tests/test_carry.py -v` (9 tests).
+Tests: `PYTHONPATH=. python3 -m pytest tests/ -v` (38 tests, incl. carry + strategy).
