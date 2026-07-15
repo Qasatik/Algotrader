@@ -40,6 +40,8 @@ def main() -> None:
     ap.add_argument("--equity-fraction", type=float, default=0.5)
     ap.add_argument("--basis-guard-bps", type=float, default=50.0)
     ap.add_argument("--dry-run", action="store_true", help="decide only, no orders")
+    ap.add_argument("--paper-equity", type=float, default=10000.0,
+                    help="simulated USDT equity for dry-run sizing (default 10000)")
     args = ap.parse_args()
 
     signal.signal(signal.SIGINT, _handle_sigint)
@@ -49,10 +51,15 @@ def main() -> None:
         leverage=args.leverage,
         equity_fraction=args.equity_fraction,
         basis_guard_bps=args.basis_guard_bps,
+        paper_equity=args.paper_equity if args.dry_run else None,
     )
-    # testnet=True forces the demo environment (no real money).
-    exchange = BybitExchange(testnet=True)
-    exchange.set_leverage(args.symbol, args.leverage)
+    if args.dry_run:
+        # Dry-run reads PUBLIC mainnet data (real funding rates, no keys needed).
+        exchange = BybitExchange(testnet=False)
+    else:
+        # Live mode uses the demo/testnet environment (no real money).
+        exchange = BybitExchange(testnet=True)
+        exchange.set_leverage(args.symbol, args.leverage)
     strat = CarryStrategy(exchange, cfg)
 
     log.info(

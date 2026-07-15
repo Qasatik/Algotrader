@@ -47,6 +47,7 @@ class CarryConfig:
     basis_guard_bps: float = 50.0  # flatten if perp premium > 50 bps (0.5%)
     rebalance_drift_bps: float = 20.0  # rebalance hedge if basis drifts > 20 bps
     qty_step: float = 0.001  # BTC lot step (round qty down to this)
+    paper_equity: float | None = None  # if set, override wallet balance (dry-run)
 
 
 @dataclass
@@ -84,6 +85,8 @@ class CarryStrategy:
     # ------------------------------------------------------------------
     def _equity_usdt(self) -> float:
         """Available USDT equity (best-effort; 0 if unreadable)."""
+        if self.cfg.paper_equity is not None:
+            return self.cfg.paper_equity
         try:
             res = self.exchange.get_wallet_balance("USDT")
             coin = res["list"][0]["coin"][0]
