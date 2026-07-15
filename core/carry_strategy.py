@@ -48,6 +48,7 @@ class CarryConfig:
     rebalance_drift_bps: float = 20.0  # rebalance hedge if basis drifts > 20 bps
     qty_step: float = 0.001  # BTC lot step (round qty down to this)
     paper_equity: float | None = None  # if set, override wallet balance (dry-run)
+    max_notional: float | None = None  # hard cap on position notional (USDT safety)
 
 
 @dataclass
@@ -104,6 +105,8 @@ class CarryStrategy:
         """
         equity = self._equity_usdt()
         notional = equity * self.cfg.equity_fraction
+        if self.cfg.max_notional is not None:
+            notional = min(notional, self.cfg.max_notional)  # hard safety cap
         raw_qty = notional / price if price > 0 else 0.0
         step = self.cfg.qty_step
         return max((raw_qty // step) * step, 0.0)
