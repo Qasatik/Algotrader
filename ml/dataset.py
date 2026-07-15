@@ -30,6 +30,7 @@ class Dataset:
     X: np.ndarray   # (N, seq_len, n_features)
     y: np.ndarray   # (N,) int labels
     times: np.ndarray  # (N,) timestamps for time-based splits
+    closes: np.ndarray  # (N,) raw close price at each sample (for backtest PnL)
 
 
 def load_candles(symbol: str, interval: str = "1") -> pd.DataFrame:
@@ -92,8 +93,9 @@ def build_dataset(
     feats_arr = feats.to_numpy(dtype="float32")
     labels = triple_barrier_labels(df["close"], take_pct, stop_pct, horizon)
     times = df["open_time"].to_numpy()
+    raw_closes = df["close"].to_numpy(dtype="float64")
 
-    X, y, t = [], [], []
+    X, y, t, c = [], [], [], []
     n = len(feats_arr)
     for i in range(seq_len, n - horizon):
         window = feats_arr[i - seq_len:i]
@@ -104,11 +106,13 @@ def build_dataset(
         X.append((window - mean) / std)
         y.append(labels[i - 1])  # label aligned to the last bar of the window
         t.append(times[i])
+        c.append(raw_closes[i - 1])  # raw close at the window's last bar
 
     return Dataset(
         X=np.asarray(X, dtype="float32"),
         y=np.asarray(y, dtype="int64"),
         times=np.asarray(t),
+        closes=np.asarray(c, dtype="float64"),
     )
 
 

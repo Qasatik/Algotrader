@@ -33,18 +33,23 @@ async def _fetch_all(exchange: BybitExchange, symbol: str, interval: str,
     """Page through kline history until we cover `days` back from now."""
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 86_400_000
-    # request 1000 candles at a time
+    # request 1000 candles at a time (Bybit max per call)
     batch = 1000
 
     all_rows: list[list[str]] = []
     cursor = now_ms
     total = 0
+    prev_oldest = None
 
     while cursor > start_ms:
-        rows = await asyncio.to_thread(exchange.get_klines, symbol, interval, batch)
+        # Bound the query to [start_ms, cursor] so each page moves backward in
+        # time. Without `end` the API always returns the same newest batch.
+        rows = await asyncio.to_thread(
+            exchange.get_klines, symbol, interval, batch, start_ms, cursor
+        )
         if not rows:
             break
-        # Bybit returns newest-first
+        # Bybit returns newest-first; last row is the oldest in this page
         oldest = int(rows[-1][0])
         all_rows.extend(rows)
         total += len(rows)
@@ -52,11 +57,16 @@ async def _fetch_all(exchange: BybitExchange, symbol: str, interval: str,
                  oldest=_ms_to_date(oldest))
         if oldest <= start_ms:
             break
+        # Guard against a stalled cursor (server returns same page) -> stop
+        if prev_oldest is not None and oldest >= prev_oldest:
+            log.warning("cursor_stalled", oldest=oldest, prev=prev_oldest)
+            break
+        prev_oldest = oldest
         cursor = oldest - 1
         await asyncio.sleep(0.15)  # be polite to the API
 
     df = _rows_to_df(all_rows)
-    df = df[df["open_time"] >= pd.Timestamp(start_ms, unit="ms")]
+    df = df[df["open_time"] >= pd.Timestamp(start_ms, unit="ms", tz="UTC")]
     return df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
 
 
@@ -93,15 +103,25 @@ async def main() -> None:
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--interval", default="1", help="candle interval (1,5,15,60,240)")
     p.add_argument("--days", type=int, default=365)
+    p.add_argument(
+        "--testnet", action="store_true",
+        help="pull from Bybit testnet (default: mainnet for real history)",
+    )
     args = p.parse_args()
 
-    log.info("start_download", symbol=args.symbol, interval=args.interval, days=args.days)
-    exchange = BybitExchange()
+    log.info("start_download", symbol=args.symbol, interval=args.interval,
+             days=args.days, testnet=args.testnet)
+    # Public market data needs no credentials; mainnet gives real history.
+    exchange = BybitExchange(testnet=args.testnet)
     df = await _fetch_all(exchange, args.symbol, args.interval, args.days)
+    if df.empty:
+        print("No data downloaded.")
+        return
     path = save_parquet(df, args.symbol, args.interval)
     log.info("done", rows=len(df), path=path,
              start=str(df["open_time"].iloc[0]), end=str(df["open_time"].iloc[-1]))
     print(f"\nSaved {len(df):,} candles -> {path}")
+    print(f"Range: {df['open_time'].iloc[0]}  ..  {df['open_time'].iloc[-1]}")
 
 
 if __name__ == "__main__":

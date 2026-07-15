@@ -15,13 +15,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import torch
 
 from backtest.metrics import PerformanceReport, equity_curve, report
-from ml.dataset import LABEL_DOWN, LABEL_UP, build_dataset
+from config.settings import get_settings
+from ml.dataset import LABEL_DOWN, LABEL_UP, build_dataset, time_split
+from ml.model import PricePredictor
 from utils.logger import get_logger
 
 log = get_logger("backtest")
@@ -97,19 +101,59 @@ def run_backtest(
     return eq, np.array(pnl_trades), rep
 
 
-def backtest_model(symbol: str, interval: str = "1") -> PerformanceReport:
-    """Train-free heuristic backtest: label = realized triple-barrier direction.
+def backtest_oracle(symbol: str, interval: str = "1") -> PerformanceReport:
+    """Oracle upper bound: uses realized triple-barrier labels as signals.
 
-    This is an *oracle* upper bound (uses future labels as signals) to sanity
-    check the cost model. Replace `predictions` with real model predictions
-    for an honest evaluation.
+    This is *not* a realistic result (it sees the future) — it validates the
+    cost model and shows the ceiling the model could approach if perfect.
     """
     ds = build_dataset(symbol=symbol, interval=interval)
-    closes = ds.X[:, -1, 0]  # proxy: not the raw close; see note below
-    # For an honest backtest, recompute closes from the dataset's last_close.
-    # Here we use labels as oracle signals to validate the cost engine.
-    eq, trades, rep = run_backtest(ds.y, closes)
+    eq, trades, rep = run_backtest(ds.y, ds.closes)
     log.info("oracle_backtest", symbol=symbol,
+             total_return=round(rep.total_return, 4),
+             sharpe=round(rep.sharpe, 2),
+             max_dd=round(rep.max_drawdown, 4),
+             trades=rep.n_trades,
+             win_rate=round(rep.win_rate, 3))
+    return rep
+
+
+@torch.inference_mode()
+def backtest_trained_model(symbol: str, interval: str = "1") -> PerformanceReport:
+    """Honest out-of-sample backtest using the trained model's predictions.
+
+    Loads the checkpoint saved by ``ml.train``, runs it only over the
+    chronological *test* split (data the model never saw), and simulates
+    trading with realistic fees/slippage on raw close prices.
+    """
+    settings = get_settings()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if not os.path.exists(settings.ml_model_path):
+        raise FileNotFoundError(
+            f"{settings.ml_model_path} not found. Train first: "
+            f"python -m ml.train --symbol {symbol} --interval {interval}"
+        )
+
+    ds = build_dataset(symbol=symbol, interval=interval)
+    _, _, _, _, Xte, yte = time_split(ds)
+    # closes aligned to the test split (last 15% of samples, chronologically)
+    i_val = int(len(ds.y) * 0.85)
+    test_closes = ds.closes[i_val:]
+
+    model = PricePredictor().to(device)
+    state = torch.load(settings.ml_model_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    model.eval()
+
+    preds = (
+        model(torch.from_numpy(Xte).to(device)).argmax(dim=-1).cpu().numpy()
+    )
+
+    eq, trades, rep = run_backtest(preds, test_closes)
+    acc = float((preds == yte).mean())
+    log.info("trained_model_backtest", symbol=symbol, device=device,
+             test_samples=len(yte), test_acc=round(acc, 4),
              total_return=round(rep.total_return, 4),
              sharpe=round(rep.sharpe, 2),
              max_dd=round(rep.max_drawdown, 4),
@@ -122,11 +166,26 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Run a backtest")
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--interval", default="1")
+    p.add_argument(
+        "--oracle", action="store_true",
+        help="run the oracle (perfect-foresight) upper bound instead of the "
+             "trained model",
+    )
     args = p.parse_args()
-    rep = backtest_model(args.symbol, args.interval)
-    print("\n=== Backtest report ===")
+
+    if args.oracle:
+        rep = backtest_oracle(args.symbol, args.interval)
+        label = "Oracle upper bound (perfect foresight)"
+    else:
+        rep = backtest_trained_model(args.symbol, args.interval)
+        label = "Trained model (out-of-sample test split)"
+
+    print(f"\n=== Backtest report — {label} ===")
     for f in rep.__dataclass_fields__:
-        print(f"  {f:16s}: {getattr(rep, f)}")
+        val = getattr(rep, f)
+        if isinstance(val, float):
+            val = round(val, 4)
+        print(f"  {f:16s}: {val}")
 
 
 if __name__ == "__main__":

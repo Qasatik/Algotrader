@@ -38,17 +38,27 @@ class BybitExchange:
     inside an asyncio executor (see ``async_to_thread`` usage in callers).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, testnet: bool | None = None) -> None:
+        """Build the HTTP session.
+
+        Args:
+            testnet: Force testnet/mainnet. When ``None`` (default) the value
+                comes from settings and ``assert_ready_for_live`` is enforced.
+                Pass ``False`` to read *public* mainnet market data (klines,
+                tickers) without credentials — used by the data pipeline.
+        """
         s = get_settings()
-        s.assert_ready_for_live()
+        if testnet is None:
+            testnet = s.is_paper_mode
+            s.assert_ready_for_live()
         self._session: HTTP = HTTP(
-            testnet=s.is_paper_mode,
+            testnet=testnet,
             api_key=s.bybit_api_key or None,
             api_secret=s.bybit_api_secret or None,
             recv_window=5000,
             timeout=s.http_timeout,
         )
-        self._log = log.bind(testnet=s.is_paper_mode)
+        self._log = log.bind(testnet=testnet)
 
     # ------------------------------------------------------------------
     # Low-level request with retry + latency tracking
@@ -89,16 +99,30 @@ class BybitExchange:
         return self._request("get_tickers", category="linear", symbol=symbol)
 
     def get_klines(
-        self, symbol: str, interval: str, limit: int = 200
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 200,
+        start: int | None = None,
+        end: int | None = None,
     ) -> list[list[str]]:
-        """Historical OHLCV candles. Returns rows: [start, open, high, low, close, volume, turnover]."""
-        res = self._request(
-            "get_kline",
-            category="linear",
-            symbol=symbol,
-            interval=interval,
-            limit=limit,
-        )
+        """Historical OHLCV candles (newest-first).
+
+        Returns rows: [start, open, high, low, close, volume, turnover].
+        ``start``/``end`` are millisecond timestamps that bound the query and
+        enable backward pagination for bulk downloads.
+        """
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
+        if start is not None:
+            params["start"] = start
+        if end is not None:
+            params["end"] = end
+        res = self._request("get_kline", **params)
         return res.get("list", [])
 
     def get_orderbook(self, symbol: str, limit: int = 50) -> dict[str, Any]:

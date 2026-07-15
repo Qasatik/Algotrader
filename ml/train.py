@@ -31,7 +31,7 @@ def _class_weights(y: np.ndarray) -> torch.Tensor:
     counts = Counter(y.tolist())
     total = len(y)
     weights = [total / (NUM_CLASSES * counts.get(c, 1)) for c in range(NUM_CLASSES)]
-    return torch.tensor(weights, dtype="float32")
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def train(
@@ -116,8 +116,9 @@ def main() -> None:
     p.add_argument("--symbol", default="BTCUSDT")
     p.add_argument("--interval", default="1")
     p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch-size", type=int, default=512)
     args = p.parse_args()
-    train(args.symbol, args.interval, args.epochs)
+    train(args.symbol, args.interval, args.epochs, batch_size=args.batch_size)
 
 
 if __name__ == "__main__":
