@@ -36,7 +36,8 @@ def _mock_exchange(funding=0.0002, perp=65000.0, spot=65000.0, equity=10000.0,
 
 def test_opens_when_funding_favorable():
     ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
-    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
     act = s.decide()
     assert act.action == "open"
     assert act.perp_side == "Sell"  # short perp
@@ -171,7 +172,9 @@ def test_rebalance_skips_when_within_tolerance():
 
 def test_execute_open_places_both_legs():
     ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
-    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
+    # Disable conviction scaling here to isolate leg-placement behaviour.
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
     act = s.decide()
     res = s.execute(act)
     assert act.action == "open"
@@ -251,3 +254,102 @@ def test_open_rolls_back_perp_if_spot_fails():
     close_call = ex.place_order.call_args_list[1]
     assert close_call.args[0]["side"] == "Buy"
     assert close_call.args[0]["reduceOnly"] is True
+
+
+# ---------------- conviction sizing --------------------
+
+def test_high_confidence_sizes_up():
+    """Strong funding + low basis → full confidence → max multiplier."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=10000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, strong_funding=0.0003,
+        size_mult_min=0.5, size_mult_max=1.5,
+    ))
+    act = s.decide()
+    assert act.action == "open"
+    assert act.confidence == pytest.approx(1.0)
+    # base qty = 10000*0.5/65000 = 0.0769; ×1.5 = 0.1154 → floored to 0.115
+    assert act.qty == pytest.approx(0.115, abs=0.001)
+
+
+def test_low_confidence_sizes_down():
+    """Marginal funding + basis near guard → low confidence → below base."""
+    ex = _mock_exchange(funding=0.00011, perp=65260.0, spot=65000.0, equity=10000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, basis_guard_bps=50.0,
+        strong_funding=0.0003, size_mult_min=0.5, size_mult_max=1.5,
+    ))
+    act = s.decide()
+    assert act.action == "open"
+    assert act.confidence < 0.05
+    base = 10000 * 0.5 / 65000  # unscaled base qty
+    assert act.qty < base  # scaled down
+
+
+def test_max_notional_caps_scaled_size():
+    """Confidence scaling can never breach the max_notional hard cap."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=100000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, max_notional=70.0,
+        strong_funding=0.0003, size_mult_min=0.5, size_mult_max=1.5,
+    ))
+    act = s.decide()
+    assert act.action == "open"
+    assert act.qty * 65000 <= 70.0 + 1e-6
+
+
+def test_confidence_logged(tmp_path: Path):
+    log_path = str(tmp_path / "trades.csv")
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, trade_log=log_path,
+        size_mult_min=1.0, size_mult_max=1.0,
+    ))
+    s.run_once()
+    with open(log_path) as f:
+        rows = list(csv.DictReader(f))
+    assert float(rows[0]["confidence"]) == pytest.approx(1.0)
+
+
+# ---------------- startup reconciliation --------------------
+
+def test_reconcile_resumes_hedged_position():
+    """An existing hedged pair is resumed, not duplicated."""
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.001, spot_btc=0.001)
+    s = CarryStrategy(ex, CarryConfig())
+    msg = s.reconcile()
+    assert s.state == CarryState.HEDGED
+    assert s.position_qty == pytest.approx(0.001)
+    assert "resumed" in msg
+    ex.place_order.assert_not_called()  # no duplicate open
+
+
+def test_reconcile_flat_when_no_position():
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.0, spot_btc=0.0)
+    s = CarryStrategy(ex, CarryConfig())
+    msg = s.reconcile()
+    assert s.state == CarryState.FLAT
+    assert "flat" in msg
+
+
+def test_reconcile_flattens_orphaned_perp():
+    """A perp short with no spot hedge (naked short) is flattened on startup."""
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.001, spot_btc=0.0)
+    s = CarryStrategy(ex, CarryConfig())
+    msg = s.reconcile()
+    assert s.state == CarryState.FLAT
+    assert "FLATTENED" in msg
+    ex.place_order.assert_called_once()  # reduce-only buy
+    close_call = ex.place_order.call_args.args[0]
+    assert close_call["side"] == "Buy"
+    assert close_call["reduceOnly"] is True
+
+
+def test_reconcile_failed_read_returns_failed():
+    """If positions can't be read, reconcile returns FAILED (do not trade)."""
+    ex = _mock_exchange(perp=65000.0, spot=65000.0)
+    ex.get_positions.side_effect = RuntimeError("api down")
+    s = CarryStrategy(ex, CarryConfig())
+    msg = s.reconcile()
+    assert msg.startswith("FAILED")
+    assert s.state == CarryState.FLAT

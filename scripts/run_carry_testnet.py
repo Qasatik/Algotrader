@@ -52,6 +52,12 @@ def main() -> None:
                     help="skip the interactive mainnet confirmation (for systemd/automation)")
     ap.add_argument("--paper-equity", type=float, default=10000.0,
                     help="simulated USDT equity for dry-run sizing (default 10000)")
+    ap.add_argument("--strong-funding", type=float, default=0.0003,
+                    help="funding rate for full-confidence sizing (default 0.03%%)")
+    ap.add_argument("--size-mult-min", type=float, default=0.75,
+                    help="size multiplier at zero confidence (default 0.75)")
+    ap.add_argument("--size-mult-max", type=float, default=1.25,
+                    help="size multiplier at full confidence (default 1.25)")
     args = ap.parse_args()
 
     # Safety: require explicit confirmation for real-money mainnet trading.
@@ -77,6 +83,9 @@ def main() -> None:
         basis_guard_bps=args.basis_guard_bps,
         min_funding_to_open=args.min_funding,
         max_notional=args.max_notional,
+        strong_funding=args.strong_funding,
+        size_mult_min=args.size_mult_min,
+        size_mult_max=args.size_mult_max,
         paper_equity=args.paper_equity if args.dry_run else None,
         # Always log trades to CSV (local persistent history) unless dry-run.
         trade_log=None if args.dry_run else DEFAULT_TRADE_LOG,
@@ -93,6 +102,17 @@ def main() -> None:
         exchange = BybitExchange(testnet=True)
         exchange.set_leverage(args.symbol, args.leverage)
     strat = CarryStrategy(exchange, cfg)
+
+    # Reconcile with the LIVE position so a restart never opens a duplicate.
+    # (Skipped in dry-run, which simulates from a clean slate.)
+    if not args.dry_run:
+        msg = strat.reconcile()
+        print(f"  reconcile: {msg}")
+        log.info("carry_reconcile", result=msg)
+        if msg.startswith("FAILED"):
+            print("  Aborting: cannot verify position state — not trading.")
+            exchange.close()
+            return
 
     if args.dry_run:
         mode = "DRY-RUN"
