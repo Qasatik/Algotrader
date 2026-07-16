@@ -20,6 +20,7 @@ import time
 from config.loader import config_defaults_from_argv
 from core.carry_strategy import DEFAULT_TRADE_LOG, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
+from core.paper_trader import PaperTrader
 from core.pnl_tracker import append_history as _pnl_append
 from core.pnl_tracker import snapshot as _pnl_snapshot
 from core.security import startup_audit as _startup_audit
@@ -133,6 +134,9 @@ def main() -> None:
         exchange = BybitExchange(testnet=True)
         exchange.set_leverage(args.symbol, args.leverage)
     strat = CarryStrategy(exchange, cfg)
+    # P3-16: in dry-run, simulate executions with a paper trader so you can see
+    # funding income, fees, and P&L without risking capital.
+    paper = PaperTrader(args.paper_equity) if args.dry_run else None
 
     # Reconcile with the LIVE position so a restart never opens a duplicate.
     # (Skipped in dry-run, which simulates from a clean slate.)
@@ -181,6 +185,14 @@ def main() -> None:
                   f"basis={act.basis_bps:+6.1f}bps  {act.reason}")
             if not args.dry_run:
                 strat.execute(act)
+            elif paper is not None:
+                # P3-16: simulate the action (open/close/hold) in the paper trader.
+                paper.apply(
+                    act,
+                    act.funding_rate or 0.0,
+                    act.perp_price or 0.0,
+                    act.spot_price or 0.0,
+                )
             _consecutive_errors = 0
             # Push notifications on significant events
             if not args.no_notify:
@@ -210,6 +222,9 @@ def main() -> None:
             basis_str = f"basis {act.basis_bps:+.1f}bps" if act else "basis ?"
             _notify(f"💚 Heartbeat | {strat.state.value} | "
                     f"{fund_str} | {basis_str} | poll #{_poll_count}")
+        # P3-16: print paper-trading P&L at heartbeat in dry-run mode.
+        if _on_hb and paper is not None and act:
+            print(paper.format_stats(act.perp_price or 0.0, act.spot_price or 0.0))
         # Log a net-worth snapshot (USDT + BTC) for P&L tracking. Independent
         # of notifications so the history builds even with --no-notify.
         if _on_hb and args.pnl_log and not args.dry_run:
