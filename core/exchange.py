@@ -165,6 +165,29 @@ class BybitExchange:
         res = self._request("get_wallet_balance", accountType="UNIFIED", coin=coin)
         return res
 
+    def get_total_equity(self) -> tuple[float, list[dict[str, float | str]]]:
+        """Unified account mark-to-market total equity (USDT) + per-coin rows.
+
+        Returns ``(total_equity_usdt, coins)`` where *coins* is a list of
+        ``{coin, wallet_balance, usd_value, unrealised_pnl}``.  Best-effort:
+        returns ``(0.0, [])`` on any read failure.
+        """
+        try:
+            res = self.get_wallet_balance()
+            acct = res["list"][0]
+            total = float(acct.get("totalEquity", 0.0) or 0.0)
+            coins: list[dict[str, float | str]] = []
+            for c in acct.get("coin", []):
+                coins.append({
+                    "coin": c.get("coin", ""),
+                    "wallet_balance": float(c.get("walletBalance", 0.0) or 0.0),
+                    "usd_value": float(c.get("usdValue", 0.0) or 0.0),
+                    "unrealised_pnl": float(c.get("unrealisedPnl", 0.0) or 0.0),
+                })
+            return total, coins
+        except (KeyError, IndexError, TypeError, ValueError):
+            return 0.0, []
+
     def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Current open positions."""
         res = self._request(

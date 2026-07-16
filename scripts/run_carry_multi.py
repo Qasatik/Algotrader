@@ -37,6 +37,8 @@ import time
 
 from core.carry_strategy import DEFAULT_TRADE_LOG, CarryAction, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
+from core.pnl_tracker import append_history as _pnl_append
+from core.pnl_tracker import snapshot as _pnl_snapshot
 from utils.logger import get_logger
 from utils.notifier import is_configured as _tg_configured
 from utils.notifier import notify as _notify
@@ -113,6 +115,9 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="exchange-side stop-loss %% from entry (default 15%%, 0=off)")
     ap.add_argument("--max-hold-hours", type=float, default=0.0,
                     help="close position after this many hours (default 0=unlimited)")
+    ap.add_argument("--pnl-log", default=None,
+                    help="append a net-worth snapshot (USDT+BTC) to this CSV "
+                         "every --heartbeat polls (P&L tracking)")
     return ap
 
 
@@ -332,12 +337,20 @@ def main() -> None:
                 if _consecutive_errors == 5 * n and not args.no_notify:
                     _notify(f"⚠️ Carry MULTI: {5*n} consecutive errors — last: {exc}")
 
-        # Heartbeat: every N polls, push a status line
-        if (args.heartbeat > 0 and _poll_count % args.heartbeat == 0
-                and not args.no_notify):
+        # Heartbeat cadence: every N polls, push status + log net worth
+        _on_hb = args.heartbeat > 0 and _poll_count % args.heartbeat == 0
+        if _on_hb and not args.no_notify:
             hedged = [s for s, st in pool.items() if st.state.value == "hedged"]
             _notify(f"💚 Heartbeat | {len(hedged)}/{n} hedged | "
                     f"{', '.join(hedged) if hedged else 'none'} | poll #{_poll_count}")
+        # Log a net-worth snapshot (USDT + BTC) for P&L tracking.
+        if _on_hb and args.pnl_log and not args.dry_run:
+            try:
+                snap = _pnl_snapshot(exchange)
+                if snap is not None:
+                    _pnl_append(args.pnl_log, snap)
+            except Exception as exc:
+                log.warning("pnl_snapshot_failed", error=str(exc))
 
         # Sleep in small increments so SIGINT is responsive
         for _ in range(args.interval):

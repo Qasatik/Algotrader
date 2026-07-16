@@ -19,6 +19,8 @@ import time
 
 from core.carry_strategy import DEFAULT_TRADE_LOG, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
+from core.pnl_tracker import append_history as _pnl_append
+from core.pnl_tracker import snapshot as _pnl_snapshot
 from utils.logger import get_logger
 from utils.notifier import is_configured as _tg_configured
 from utils.notifier import notify as _notify
@@ -69,6 +71,9 @@ def main() -> None:
                     help="exchange-side stop-loss %% from entry (default 15%%, 0=off)")
     ap.add_argument("--max-hold-hours", type=float, default=0.0,
                     help="close position after this many hours (default 0=unlimited)")
+    ap.add_argument("--pnl-log", default=None,
+                    help="append a net-worth snapshot (USDT+BTC) to this CSV "
+                         "every --heartbeat polls (P&L tracking)")
     args = ap.parse_args()
 
     # Safety: require explicit confirmation for real-money mainnet trading.
@@ -184,14 +189,23 @@ def main() -> None:
             if _consecutive_errors == 5 and not args.no_notify:
                 _notify(f"⚠️ Carry bot: 5 consecutive poll errors — last: {exc}")
 
-        # Heartbeat: every N polls, push a status line
+        # Heartbeat cadence: every N polls, push status + log net worth
         _poll_count += 1
-        if (args.heartbeat > 0 and _poll_count % args.heartbeat == 0
-                and not args.no_notify):
+        _on_hb = args.heartbeat > 0 and _poll_count % args.heartbeat == 0
+        if _on_hb and not args.no_notify:
             fund_str = f"funding {act.funding_rate*100:+.4f}%" if act else "funding ?"
             basis_str = f"basis {act.basis_bps:+.1f}bps" if act else "basis ?"
             _notify(f"💚 Heartbeat | {strat.state.value} | "
                     f"{fund_str} | {basis_str} | poll #{_poll_count}")
+        # Log a net-worth snapshot (USDT + BTC) for P&L tracking. Independent
+        # of notifications so the history builds even with --no-notify.
+        if _on_hb and args.pnl_log and not args.dry_run:
+            try:
+                snap = _pnl_snapshot(exchange)
+                if snap is not None:
+                    _pnl_append(args.pnl_log, snap)
+            except Exception as exc:
+                log.warning("pnl_snapshot_failed", error=str(exc))
 
         # sleep in small increments so SIGINT is responsive
         for _ in range(args.interval):
