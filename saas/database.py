@@ -61,10 +61,25 @@ CREATE TABLE IF NOT EXISTS referral_earnings (
     created_at  REAL    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS invoices (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan           TEXT    NOT NULL,
+    amount_usdt    REAL    NOT NULL,
+    status         TEXT    NOT NULL DEFAULT 'pending',
+    payment_method TEXT    NOT NULL DEFAULT '',
+    payment_id     TEXT    NOT NULL DEFAULT '',
+    created_at     REAL    NOT NULL,
+    expires_at     REAL    NOT NULL DEFAULT 0,
+    paid_at        REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_telegram   ON users(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_users_referral   ON users(referral_code);
 CREATE INDEX IF NOT EXISTS idx_subs_user        ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_referral_referrer ON referral_earnings(referrer_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_user    ON invoices(user_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_status  ON invoices(status);
 """
 
 
