@@ -239,11 +239,16 @@ class CarryStrategy:
     # ------------------------------------------------------------------
     # Decision logic (pure / testable)
     # ------------------------------------------------------------------
-    def decide(self) -> CarryAction:
+    def decide(self, can_open: bool = True) -> CarryAction:
         """Poll funding + basis and return the next action.
 
         Updates ``self.state`` / ``self.position_qty`` as a side effect so the
         strategy is stateful across calls.
+
+        When *can_open* is ``False`` the strategy will never open a new
+        position (used by the multi-symbol rotation manager to cap concurrent
+        positions).  Existing HEDGED positions are still monitored for
+        close/rebalance signals.
         """
         self._poll_count += 1
         fr = self.exchange.get_funding_rate(self.cfg.symbol)
@@ -254,8 +259,11 @@ class CarryStrategy:
 
         if self.state == CarryState.HEDGED:
             act = self._decide_hedged(funding, basis)
-        else:
+        elif can_open:
             act = self._decide_flat(funding, basis, perp_price or spot_price)
+        else:
+            act = CarryAction("none", "rotation: not in top-N",
+                              funding_rate=funding, basis_bps=basis)
         act.perp_price = perp_price
         act.spot_price = spot_price
         return act

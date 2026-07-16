@@ -1,222 +1,238 @@
-# 🤖 Bybit Algo Trading Bot (GPU + ML + Telegram Admin + 2FA)
+# 📊 Bybit Delta-Neutral Carry Bot
 
-A production-grade, event-driven algorithmic trading bot for **Bybit (V5 unified account)** that runs **GPU-based ML inference** for short-horizon price prediction, ships with a **Telegram admin panel protected by TOTP 2FA**, full **CI/CD**, Docker GPU support, and Prometheus/Grafana observability.
+> **Production-grade funding-rate arbitrage bot running live on Bybit mainnet.**
+> Earns funding yield by holding a delta-neutral position (short perpetual + long spot)
+> across multiple symbols simultaneously, with full risk management and observability.
 
----
-
-## 🌐 1. Hosting: closest to Bybit for minimum latency
-
-**Why it matters:** Bybit's matching engine and REST/WebSocket API are hosted on **AWS in Singapore (`ap-southeast-1`)**. The single biggest latency win is running the bot in the **same AWS region / same data center**. Cross-region or cross-cloud adds 20–150 ms — enough to lose fills and get slipped.
-
-### ✅ Recommended: AWS `ap-southeast-1` (Singapore)
-
-| Goal | Instance | GPU | VRAM | Notes |
-|------|----------|-----|------|-------|
-| Cheapest GPU, same region | `g4dn.xlarge` | 1× T4 | 16 GB | Fine for small model inference |
-| Balanced (recommended) | `g5.2xlarge` | 1× A10G | 24 GB | Good price/perf |
-| **~50 GB VRAM target** | `g5.48xlarge` | 8× A10G | 8×24=192 GB | Use 1 GPU or pool |
-| High-end | `p4d.24xlarge` | 8× A100 | 8×40=320 GB | For large models |
-| Single big GPU | `p4de.24xlarge` | 8× A100 | 8×80=640 GB | |
-
-> **About "50 GB GPU":** there is no single consumer GPU with exactly 50 GB. The closest single-GPU options are **NVIDIA L40S (48 GB)**, **RTX A6000 (48 GB)**, or **A100 (40/80 GB)**. On AWS Singapore, request an **L40S** (`g6e`) or use an **A100** instance. If you only need inference, a single 24 GB A10G is more than enough for this bot's GRU model.
-
-### Alternative providers with Singapore presence (single ~48 GB GPU)
-
-| Provider | Region | GPU option | Latency to Bybit |
-|----------|--------|-----------|------------------|
-| **Vultr Cloud GPU** | Singapore | A100 80 GB | ~2–6 ms |
-| **RunPod / Vast.ai** | SG | RTX A6000 48 GB | ~2–8 ms |
-| **Lambda Labs** | SG | H100 / A100 | ~2–6 ms |
-| **Tencent / Alibaba Cloud** | Singapore | various | ~3–10 ms |
-
-### Verify your latency (do this before trusting a host)
-
-```bash
-python scripts/latency_check.py
-```
-Target: **median (p50) < 5 ms** to `api.bybit.com`. If you see >20 ms, you are in the wrong region.
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-27%20passing-brightgreen.svg)](#testing)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ---
 
-## 🏗️ 2. Architecture
+## 🎯 What it does
+
+The bot executes a **delta-neutral funding carry** strategy:
+
+1. **Short** a perpetual futures contract (e.g. BTCUSDT)
+2. **Long** the equivalent spot pair (e.g. BTCUSDT spot)
+3. Price moves cancel out → **collect funding payments every 8 hours**
+4. Close when funding turns negative (EV-gated) or basis blows out (squeeze guard)
 
 ```
-                 ┌──────────────────────────────────────────────┐
-   Bybit WS  ──▶ │ MarketDataFeed (orderbook + klines, in-mem)   │
-                 └───────────────┬──────────────────────────────┘
-                                 │ closed candle
-                                 ▼
-                 ┌──────────────────────────────────────────────┐
-                 │ Strategy = ML(InferenceEngine on GPU)         │
-                 │          + order-book imbalance confirmation  │
-                 └───────────────┬──────────────────────────────┘
-                                 │ Signal (BUY/SELL/HOLD)
-                                 ▼
-                 ┌──────────────────────────────────────────────┐
-                 │ RiskManager (position size, exposure limits)  │
-                 └───────────────┬──────────────────────────────┘
-                                 │ ApprovedTrade
-                                 ▼
-                 ┌──────────────────────────────────────────────┐
-                 │ OrderManager (market + SL/TP bracket)         │
-                 └──────────────────────────────────────────────┘
-
-   Control plane:  Telegram bot ──2FA(TOTP)──▶ TradingEngine.start/stop/kill
-   Observability:  Prometheus (:9090/metrics) + Grafana (:3000)
+  FLAT  ──funding≥min──▶  HEDGED  ──basis blowout──▶  FLAT
+                               │
+                               ├─drift>threshold─▶ REBALANCE
+                               └─collects funding every 8h
 ```
 
-**Data flow is event-driven:** the bot reacts to each *closed* candle, runs GPU inference, and only places orders that pass risk checks. The Telegram bot can start/stop/flatten the engine at any time.
+### Why it works
+
+When perpetual funding is **positive**, longs pay shorts. By being short perp + long spot
+(delta = 0), we're market-neutral but **receive the funding payment** as pure yield.
+Typical rates: **6–15% annualised** on major crypto pairs.
 
 ---
 
-## 📁 3. Project structure
+## ✨ Key features
 
-```
-bybit-algo-bot/
-├── main.py                  # Entry point (asyncio loop)
-├── config/settings.py       # Pydantic-validated config from .env
-├── core/
-│   ├── exchange.py          # Bybit V5 HTTP wrapper + retry + latency
-│   ├── data_feed.py         # WebSocket orderbook + klines
-│   ├── strategy.py          # ML + orderbook strategy
-│   ├── risk_manager.py      # Position sizing & exposure gate
-│   ├── order_manager.py     # Order execution (SL/TP brackets)
-│   └── engine.py            # Orchestrator (start/stop/kill_switch)
-├── ml/
-│   ├── features.py          # RSI, MACD, Bollinger, vol features
-│   ├── model.py             # PyTorch GRU classifier
-│   └── inference.py         # GPU inference engine
-├── security/totp.py         # RFC 6238 TOTP (2FA), stdlib only
-├── bot/telegram_admin.py    # Telegram admin panel + 2FA sessions
-├── utils/{logger,metrics}.py
-├── tests/                   # pytest: 2FA, features, risk
-├── scripts/{latency_check,bootstrap_model}.py
-├── deploy/{deploy.sh,prometheus.yml}
-├── Dockerfile               # CUDA 12.1 GPU image
-├── docker-compose.yml       # bot + prometheus + grafana
-└── .github/workflows/       # ci.yml + deploy.yml
-```
+| Feature | Description |
+|---------|-------------|
+| **Multi-symbol trading** | Run N carry positions simultaneously across BTC, ETH, BNB, SOL, etc. with auto-detected lot sizes |
+| **Funding rate scanner** | Real-time scanner ranking 14+ symbols by funding yield with annualised rate |
+| **EV-gated exit** | Only closes when projected holding loss > round-trip close cost (prevents churning) |
+| **Basis guard** | Flattens instantly if perp premium over spot exceeds threshold (short-squeeze protection) |
+| **Exchange-side stop-loss** | Server-side SL on Bybit — protects position even when bot is offline |
+| **Position reconciliation** | Syncs with live exchange state on restart — never opens duplicate positions |
+| **Auto-rebalance** | Re-aligns perp/spot legs when delta drifts beyond threshold |
+| **Liquidation monitor** | Warns when mark price approaches liquidation |
+| **Conviction sizing** | Scales position size with entry confidence (funding cushion × basis safety) |
+| **Telegram push** | Real-time notifications on open/close/rebalance/errors |
+| **File logging** | Rotating log files (5 MB × 5) survive terminal close |
+| **systemd ready** | Runs as a daemon service with `--yes` flag for automation |
 
 ---
 
-## 🚀 4. Quick start (local, testnet)
+## 🏗️ Architecture
+
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │                    CarryStrategy                         │
+  │  ┌─────────────┐   ┌──────────────┐   ┌──────────────┐ │
+  │  │  decide()   │──▶│  execute()   │──▶│  _log_trade  │ │
+  │  │ (pure logic)│   │ (real orders)│   │   (CSV log)  │ │
+  │  └──────┬──────┘   └──────┬───────┘   └──────────────┘ │
+  │         │                 │                             │
+  │    funding+basis     perp short + spot long             │
+  └─────────┼─────────────────┼─────────────────────────────┘
+            │                 │
+  ┌─────────▼─────────┐ ┌────▼──────────────────┐
+  │  BybitExchange    │ │  Risk Management      │
+  │  (V5 HTTP + retry)│ │  • Basis guard (50bps)│
+  │                   │ │  • EV-gated exit      │
+  │  get_funding_rate │ │  • Exchange SL (15%)  │
+  │  get_spot_price   │ │  • Liq proximity      │
+  │  place_order      │ │  • Rebalance (20bps)  │
+  │  set_trading_stop │ │  • Max hold time      │
+  └───────────────────┘ └───────────────────────┘
+```
+
+**Design principle:** `decide()` is pure logic (reads market data, returns action,
+updates state) — fully unit-testable with a mock exchange. `execute()` turns the
+action into real orders with rollback safety.
+
+---
+
+## 🚀 Quick start
 
 ```bash
 cd bybit-algo-bot
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1. Configure secrets
-cp .env.example .env          # then edit (see §5)
+# Configure API keys
+cp .env.example .env  # edit with your Bybit API key/secret
 
-# 2. Create a model checkpoint (dummy, replace later)
-python scripts/bootstrap_model.py
+# 1. Scan for the best funding rates
+PYTHONPATH=. python3 scripts/scan_funding.py
 
-# 3. Verify latency
-python scripts/latency_check.py
+# 2. Dry-run (no orders, just decisions)
+PYTHONPATH=. python3 scripts/run_carry_multi.py --dry-run \
+  --symbols BTCUSDT,ETHUSDT,BNBUSDT --interval 5
 
-# 4. Run
-python main.py
+# 3. Live on mainnet (REAL MONEY)
+PYTHONPATH=. python3 scripts/run_carry_multi.py --mainnet --yes \
+  --symbols BTCUSDT,ETHUSDT,BNBUSDT --interval 5 \
+  --equity-fraction 0.7 --max-notional 50 --leverage 2
 ```
 
-Then talk to your Telegram bot: `/start` → `/setup_2fa` (scan QR) → `/auth <code>` → `/status`.
-
----
-
-## 🔐 5. Configuration (`.env`)
-
-| Variable | Description |
-|----------|-------------|
-| `BYBIT_API_KEY` / `BYBIT_API_SECRET` | Bybit API keys (testnet first!) |
-| `BYBIT_TESTNET` | `true` = paper/testnet, `false` = live |
-| `TRADING_SYMBOL` | Linear perp, e.g. `BTCUSDT` |
-| `RISK_PER_TRADE` | Fraction of equity risked per trade (0.01 = 1%) |
-| `LEVERAGE` | Position leverage (x) |
-| `ML_DEVICE` | `cuda:0` or `cpu` |
-| `ML_MODEL_PATH` | PyTorch checkpoint path |
-| `ML_CONFIDENCE_THRESHOLD` | Min softmax confidence to act |
-| `TELEGRAM_BOT_TOKEN` | From @BotFather |
-| `TELEGRAM_ADMIN_IDS` | Comma-separated allowed Telegram user IDs |
-| `TOTP_SECRET` | Base32 2FA secret (generate below) |
-| `SESSION_TTL` | Seconds a 2FA unlock lasts |
-
-### Generate a 2FA secret
+### Monitor your positions
 
 ```bash
-python -m security.totp --generate
-# -> Secret: XXXX...   add it to .env as TOTP_SECRET
+# Live position dashboard (auto-refresh)
+PYTHONPATH=. python3 scripts/show_position.py --mainnet --watch 10
+
+# Trade history
+PYTHONPATH=. python3 scripts/show_trades.py --mainnet
 ```
-Then in Telegram: `/setup_2fa` → scan the QR with Google Authenticator / Authy / 1Password.
 
 ---
 
-## 📱 6. Telegram admin commands
-
-| Command | 2FA? | Action |
-|---------|------|--------|
-| `/start`, `/help` | — | Info |
-| `/setup_2fa` | — | Generate QR code |
-| `/auth <code>` | — | Unlock privileged commands |
-| `/status` | read | Engine state, equity, stats |
-| `/positions` | read | Open positions |
-| `/pnl` | read | Unrealized PnL |
-| `/start_engine` | ✅ | Start trading |
-| `/stop_engine` | ✅ | Graceful stop (keeps positions) |
-| `/pause` / `/resume` | ✅ | Toggle order placement |
-| `/kill` | ✅ | **EMERGENCY**: stop + flatten position |
-
-**Security model:** user-ID whitelist + TOTP 2FA session (TTL-based). Read-only commands are always available; anything that moves money requires an active 2FA session.
-
----
-
-## 🐳 7. Docker (GPU) deployment
-
-Requires **NVIDIA Container Toolkit** on the host (`nvidia-smi` should work).
+## 📡 Funding rate scanner
 
 ```bash
-cp .env.example .env && nano .env       # fill secrets
-docker compose up -d --build            # bot + prometheus + grafana
-docker compose logs -f bot
+PYTHONPATH=. python3 scripts/scan_funding.py
 ```
 
-- Metrics: `http://<host>:9090/metrics`
-- Grafana: `http://<host>:3000` (admin / `$GRAFANA_PASSWORD`)
+```
+═══════════════════════════════════════════════════════════════════════
+  📡 FUNDING RATE SCANNER  |  14 symbols
+═══════════════════════════════════════════════════════════════════════
+  Symbol       Funding/8h   Annualised  Basis bps
+  BNBUSDT      +0.0100% ★   +11.0%       -3.4
+  AVAXUSDT     +0.0094%     +10.3%       -4.5
+  BTCUSDT      +0.0058%      +6.3%       -5.3
+  ETHUSDT      +0.0029%      +3.1%       -5.3
+═══════════════════════════════════════════════════════════════════════
+```
 
 ---
 
-## 🔁 8. CI/CD (GitHub Actions)
+## 📊 Backtest results
 
-- **`.github/workflows/ci.yml`** — on every push/PR: `ruff` lint, compile check, pytest, Docker build (no push).
-- **`.github/workflows/deploy.yml`** — on `main`: build + push image to **GHCR**, then SSH-deploy to the Singapore host (`docker compose pull && up -d`).
+See [`CARRY_RESULTS.md`](CARRY_RESULTS.md) for the full analysis. Headline:
 
-### Required GitHub secrets (Settings → Secrets)
-
-| Secret | Purpose |
-|--------|---------|
-| `DEPLOY_HOST` | Singapore server IP/hostname |
-| `DEPLOY_USER` | SSH user |
-| `DEPLOY_SSH_KEY` | Private SSH key |
-| `DEPLOY_PATH` | Project path on server (e.g. `/opt/bybit-bot`) |
-
-Set the `production` environment to **require manual approval** for safe releases.
+- **Passive carry** (always hedged): **+18.2% annualised** on historical funding data
+- **Timed strategy** (enter/exit on threshold): **+12.4% annualised** after fees
+- **Round-trip cost:** 0.31% (perp taker 0.055% + spot taker 0.10% + slippage, ×2 legs)
 
 ---
 
-## 🧪 9. Tests
+## 🛡️ Risk management
+
+| Layer | What it protects against |
+|-------|------------------------|
+| **Basis guard** (50 bps) | Short squeeze — perp premium blowout |
+| **Exchange-side SL** (15%) | Liquidation — server-side, works offline |
+| **EV-gated exit** | Churning — only close when it's worth the fee |
+| **Rebalance** (20 bps drift) | Delta drift — legs out of alignment |
+| **Liq monitor** (15% proximity) | Early warning before liquidation |
+| **Rollback safety** | Unhedged short — closes perp if spot leg fails |
+| **Max notional cap** | Over-leverage — hard cap per position |
+
+---
+
+## 🧪 Testing
 
 ```bash
-pytest -v
+PYTHONPATH=. python3 -m pytest tests/ -v
 ```
-Covers: TOTP round-trips + RFC 4226 vectors, feature shapes/normalization, risk-manager sizing & exposure limits.
+
+27 tests covering: entry/exit logic, basis guard, EV-gated exit, conviction sizing,
+rebalance, reconciliation, rollback safety, trade logging, and more.
 
 ---
 
-## ⚠️ 10. Risk disclaimer
+## 📁 Project structure
 
-Algorithmic trading of leveraged crypto products carries **substantial risk of total capital loss**. This software is provided for educational purposes with **no warranty**. Always:
-1. Validate on **testnet** first.
-2. Start with the **smallest possible size**.
-3. Never trade money you cannot afford to lose.
-4. Audit the model, risk parameters, and order logic before going live.
+```
+bybit-algo-bot/
+├── core/
+│   ├── carry_strategy.py     # Delta-neutral carry state machine
+│   ├── carry_stats.py        # Position statistics
+│   ├── exchange.py           # Bybit V5 HTTP wrapper + retry + latency
+│   ├── engine.py             # ML trading engine orchestrator
+│   ├── strategy.py           # ML + orderbook strategy
+│   ├── risk_manager.py       # Position sizing & circuit breakers
+│   └── order_manager.py      # Order execution (maker/taker)
+├── backtest/
+│   ├── carry.py              # Carry strategy backtest
+│   ├── engine.py             # Vectorised backtesting engine
+│   └── metrics.py            # Sharpe, Sortino, max drawdown
+├── ml/
+│   ├── model.py              # PyTorch GRU price predictor
+│   ├── features.py           # RSI, MACD, Bollinger features
+│   ├── dataset.py            # Triple-barrier labeling
+│   └── train.py              # Training pipeline
+├── scripts/
+│   ├── run_carry_multi.py    # Multi-symbol carry runner
+│   ├── run_carry_testnet.py  # Single-symbol carry runner
+│   ├── scan_funding.py       # Funding rate scanner
+│   ├── show_position.py      # Live position dashboard
+│   └── show_trades.py        # Trade history viewer
+├── bot/telegram_admin.py     # Telegram admin panel + TOTP 2FA
+├── utils/
+│   ├── logger.py             # structlog + rotating file
+│   └── notifier.py           # Telegram push notifications
+├── config/settings.py        # Pydantic-validated config
+├── tests/                    # 27 pytest tests
+├── Dockerfile                # CUDA 12.1 GPU image
+└── .github/workflows/        # CI/CD pipelines
+```
 
-The included model is **untrained** (`bootstrap_model.py`). You must supply a properly trained and backtested checkpoint before live trading.
+---
+
+## 🛠️ Tech stack
+
+- **Python 3.12+** — type hints, dataclasses, `match` statements
+- **pybit** — official Bybit V5 SDK
+- **structlog** — structured JSON logging
+- **Pydantic** — validated configuration
+- **tenacity** — exponential-backoff retries
+- **pytest** — unit testing
+- **ruff + black** — linting & formatting
+- **Docker + systemd** — deployment
+
+---
+
+## 📜 License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## ⚠️ Disclaimer
+
+This software is for educational purposes. Cryptocurrency trading carries significant
+risk. The authors are not responsible for any financial losses. Always test on testnet
+first and never trade with money you can't afford to lose.
