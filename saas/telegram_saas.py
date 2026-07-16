@@ -30,13 +30,22 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
-from telegram import Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from saas.billing import BillingService
@@ -79,6 +88,7 @@ class SaaSTelegramBot:
     # ------------------------------------------------------------------
     def _register_handlers(self) -> None:
         add = self.app.add_handler
+        # Slash commands
         add(CommandHandler("start", self._cmd_start))
         add(CommandHandler("pricing", self._cmd_pricing))
         add(CommandHandler("subscribe", self._cmd_subscribe))
@@ -88,6 +98,45 @@ class SaaSTelegramBot:
         add(CommandHandler("referral", self._cmd_referral))
         add(CommandHandler("admin_pay", self._cmd_admin_pay))
         add(CommandHandler("help", self._cmd_help))
+        # Inline button callbacks (subscribe:basic, pay, etc.)
+        add(CallbackQueryHandler(self._handle_callback))
+        # Reply-keyboard menu buttons (text matching)
+        add(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, self._handle_menu_text,
+        ))
+
+    # ------------------------------------------------------------------
+    # Keyboards
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _main_keyboard() -> ReplyKeyboardMarkup:
+        """Persistent main-menu keyboard (always visible below input)."""
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton("💰 Тарифы"), KeyboardButton("📋 Мой тариф")],
+                [KeyboardButton("🧾 Мои счета"), KeyboardButton("🎁 Рефералка")],
+                [KeyboardButton("💳 Оплатить"), KeyboardButton("❓ Помощь")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=False,
+        )
+
+    @staticmethod
+    def _pricing_keyboard() -> InlineKeyboardMarkup:
+        """Inline tier-selection buttons for the /pricing message."""
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(
+                    "BASIC — $3/мес", callback_data="subscribe:basic",
+                )],
+                [InlineKeyboardButton(
+                    "PRO — $8/мес", callback_data="subscribe:pro",
+                )],
+                [InlineKeyboardButton(
+                    "VIP — $15/мес", callback_data="subscribe:vip",
+                )],
+            ]
+        )
 
     async def start(self) -> None:
         """Start polling (blocks)."""
@@ -142,6 +191,42 @@ class SaaSTelegramBot:
         return s.rstrip("0").rstrip(".")
 
     # ------------------------------------------------------------------
+    # Interactive handlers (inline buttons + reply-keyboard menu)
+    # ------------------------------------------------------------------
+    async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline-keyboard button presses (subscribe:basic, etc.)."""
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        data = query.data or ""
+
+        if data.startswith("subscribe:"):
+            tier_name = data.removeprefix("subscribe:")
+            # Inject as ctx.args so _cmd_subscribe handles it.
+            ctx.args = [tier_name]
+            await self._cmd_subscribe(update, ctx)
+        elif data == "pay":
+            await self._cmd_pay(update, ctx)
+        elif data == "myplan":
+            await self._cmd_myplan(update, ctx)
+
+    async def _handle_menu_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route reply-keyboard button presses to the right command."""
+        text = (update.message.text or "").strip()
+        routing = {
+            "💰 Тарифы": self._cmd_pricing,
+            "📋 Мой тариф": self._cmd_myplan,
+            "🧾 Мои счета": self._cmd_invoices,
+            "🎁 Рефералка": self._cmd_referral,
+            "💳 Оплатить": self._cmd_pay,
+            "❓ Помощь": self._cmd_help,
+        }
+        handler = routing.get(text)
+        if handler:
+            await handler(update, ctx)
+
+    # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
     async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -174,14 +259,12 @@ class SaaSTelegramBot:
             f"хеджируя риск движения цены.\n\n"
             f"🎯 Ваш тариф: <b>{user.effective_tier.value.upper()}</b>\n"
             f"⏳ Осталось: <b>{trial_days:.0f}</b> дней\n\n"
-            f"Команды:\n"
-            f"  /pricing — тарифы\n"
-            f"  /subscribe pro — оформить подписку\n"
-            f"  /myplan — мой тариф и лимиты\n"
-            f"  /referral — реферальная программа\n"
-            f"  /help — все команды"
+            f"Используйте кнопки меню ниже 👇"
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=self._main_keyboard(),
+        )
 
     async def _cmd_pricing(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Display the subscription pricing table."""
@@ -198,9 +281,11 @@ class SaaSTelegramBot:
                 f"   🔄 Ребалансировка: {rebal}\n"
             )
         lines.append("🎁 FREE: 1 символ, $100, 7 дней триала")
-        lines.append("\n/subscribe <b>pro</b> — оформить →")
+        lines.append("\n👇 Выберите тариф для оформления:")
         await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML,
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=self._pricing_keyboard(),
         )
 
     async def _cmd_subscribe(
@@ -412,6 +497,32 @@ class SaaSTelegramBot:
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.HTML,
         )
+
+    # ------------------------------------------------------------------
+    # Proactive messaging (for reports / retention alerts)
+    # ------------------------------------------------------------------
+    async def send_to_user(self, telegram_id: int, text: str) -> bool:
+        """Send a proactive message to a user by Telegram ID.
+
+        Returns ``True`` on success, ``False`` if the user hasn't started
+        the bot (can't initiate conversations) or on delivery failure.
+        """
+        try:
+            await self.app.bot.send_message(
+                chat_id=telegram_id, text=text, parse_mode=ParseMode.HTML,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — don't crash the notifier
+            log.warning("send_to_user_failed", telegram_id=telegram_id, error=str(exc))
+            return False
+
+    async def broadcast(self, telegram_ids: list[int], text: str) -> int:
+        """Send *text* to multiple users.  Returns the count delivered."""
+        delivered = 0
+        for tid in telegram_ids:
+            if await self.send_to_user(tid, text):
+                delivered += 1
+        return delivered
 
 
 # ═══════════════════════════════════════════════════════════════════════════

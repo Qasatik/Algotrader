@@ -32,10 +32,22 @@ class _MockUser:
 
 @dataclass
 class _MockMessage:
+    text: str = ""
     replies: list[str] = field(default_factory=list)
+    reply_markups: list = field(default_factory=list)
 
-    async def reply_text(self, text: str, parse_mode=None) -> None:
+    async def reply_text(self, text: str, parse_mode=None, reply_markup=None) -> None:
         self.replies.append(text)
+        self.reply_markups.append(reply_markup)
+
+
+@dataclass
+class _MockCallbackQuery:
+    data: str = ""
+    answered: bool = False
+
+    async def answer(self) -> None:
+        self.answered = True
 
 
 @dataclass
@@ -49,6 +61,13 @@ class _MockContext:
     bot: _MockBot = field(default_factory=_MockBot)
 
 
+@dataclass
+class _MockUpdateContainer:
+    effective_user: _MockUser
+    message: _MockMessage
+    callback_query: _MockCallbackQuery | None = None
+
+
 def _make_update(uid: int, username: str = "tester") -> tuple:
     """Return ``(update, ctx)`` mock pair for a given Telegram user."""
     msg = _MockMessage()
@@ -60,10 +79,28 @@ def _make_update(uid: int, username: str = "tester") -> tuple:
     return update, ctx
 
 
-@dataclass
-class _MockUpdateContainer:
-    effective_user: _MockUser
-    message: _MockMessage
+def _make_callback_update(uid: int, callback_data: str, username: str = "tester") -> tuple:
+    """Mock update for an inline-button press (callback query)."""
+    msg = _MockMessage()
+    cq = _MockCallbackQuery(data=callback_data)
+    update = _MockUpdateContainer(
+        effective_user=_MockUser(id=uid, username=username),
+        message=msg,
+        callback_query=cq,
+    )
+    ctx = _MockContext()
+    return update, ctx
+
+
+def _make_text_update(uid: int, text: str, username: str = "tester") -> tuple:
+    """Mock update for a reply-keyboard button press (text message)."""
+    msg = _MockMessage(text=text)
+    update = _MockUpdateContainer(
+        effective_user=_MockUser(id=uid, username=username),
+        message=msg,
+    )
+    ctx = _MockContext()
+    return update, ctx
 
 
 def _run(coro):
@@ -466,3 +503,140 @@ class TestMdToHtml:
 
     def test_no_backticks_unchanged(self):
         assert _md_to_html("plain text") == "plain text"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Keyboards (inline + reply)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestKeyboards:
+    def test_main_keyboard_has_buttons(self, bot):
+        kb = bot._main_keyboard()
+        # ReplyKeyboardMarkup has .keyboard attribute
+        assert kb is not None
+        assert len(kb.keyboard) >= 2
+
+    def test_pricing_keyboard_has_tiers(self, bot):
+        kb = bot._pricing_keyboard()
+        assert kb is not None
+        # InlineKeyboardMarkup has .inline_keyboard
+        buttons = [btn for row in kb.inline_keyboard for btn in row]
+        texts = [b.text for b in buttons]
+        assert any("BASIC" in t for t in texts)
+        assert any("PRO" in t for t in texts)
+        assert any("VIP" in t for t in texts)
+        # Check callback_data
+        datas = [b.callback_data for b in buttons]
+        assert "subscribe:basic" in datas
+        assert "subscribe:pro" in datas
+        assert "subscribe:vip" in datas
+
+    def test_start_includes_main_keyboard(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_start(update, ctx))
+        # The last reply should have a reply_markup (main keyboard).
+        assert update.message.reply_markups[-1] is not None
+
+    def test_pricing_includes_inline_keyboard(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_pricing(update, ctx))
+        markup = update.message.reply_markups[-1]
+        assert markup is not None
+        # Should be an InlineKeyboardMarkup with tier buttons.
+        buttons = [btn for row in markup.inline_keyboard for btn in row]
+        assert any(b.callback_data == "subscribe:pro" for b in buttons)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Callback handler (inline button presses)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCallbackHandler:
+    def test_subscribe_callback_creates_invoice(self, bot):
+        # Register first.
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        # Press "subscribe:pro" inline button.
+        cb, cc = _make_callback_update(111, "subscribe:pro")
+        _run(bot._handle_callback(cb, cc))
+
+        assert cb.callback_query.answered  # query.answer() was called
+        text = cb.message.replies[-1]
+        assert "PRO" in text
+        assert "Счёт" in text
+
+    def test_pay_callback(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        c.args = ["basic"]
+        _run(bot._cmd_subscribe(u, c))
+
+        cb, cc = _make_callback_update(111, "pay")
+        _run(bot._handle_callback(cb, cc))
+        text = cb.message.replies[-1]
+        assert "Счёт" in text
+
+    def test_unknown_callback_ignored(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        cb, cc = _make_callback_update(111, "unknown_action")
+        _run(bot._handle_callback(cb, cc))
+        # Should answer the query but not crash.
+        assert cb.callback_query.answered
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Menu text handler (reply keyboard buttons)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMenuText:
+    def test_pricing_button(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        tu, tc = _make_text_update(111, "💰 Тарифы")
+        _run(bot._handle_menu_text(tu, tc))
+        text = tu.message.replies[-1]
+        assert "Тарифы" in text
+        assert "BASIC" in text
+
+    def test_myplan_button(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        tu, tc = _make_text_update(111, "📋 Мой тариф")
+        _run(bot._handle_menu_text(tu, tc))
+        text = tu.message.replies[-1]
+        assert "FREE" in text
+
+    def test_referral_button(self, bot):
+        u, c = _make_update(111, "alice")
+        _run(bot._cmd_start(u, _MockContext()))
+
+        tu, tc = _make_text_update(111, "🎁 Рефералка")
+        _run(bot._handle_menu_text(tu, tc))
+        text = tu.message.replies[-1]
+        assert "Реферальная" in text
+
+    def test_help_button(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        tu, tc = _make_text_update(111, "❓ Помощь")
+        _run(bot._handle_menu_text(tu, tc))
+        text = tu.message.replies[-1]
+        assert "/pricing" in text
+
+    def test_unrecognized_text_ignored(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        tu, tc = _make_text_update(111, "random text")
+        _run(bot._handle_menu_text(tu, tc))
+        # No replies should be added (handler ignores unknown text).
+        assert len(tu.message.replies) == 0
