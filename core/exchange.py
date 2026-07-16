@@ -50,8 +50,8 @@ class BybitExchange:
                 comes from settings and ``assert_ready_for_live`` is enforced.
                 Pass ``False`` to read *public* mainnet market data (klines,
                 tickers) without credentials — used by the data pipeline.
-            api_key / api_secret: Explicit credentials for multi-account
-                support (one exchange instance per account). When omitted,
+            api_key / api_secret: Explicit credentials (multi-tenant SaaS —
+                one exchange per user with their own BYOK keys). When omitted,
                 credentials fall back to the global settings/env.
         """
         s = get_settings()

@@ -5,12 +5,8 @@
 > across multiple symbols simultaneously, with full risk management and observability.
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Bybit V5](https://img.shields.io/badge/Bybit-V5%20API-orange.svg)](https://bybit-exchange.github.io/docs/v5/intro)
-
-> 💡 **Prefer a managed service?** A hosted version with Telegram control,
->> multi-symbol automation, and zero setup is available as a subscription.
->> The engine you see here is 100% open-source — run it yourself or let us host it.
+[![Tests](https://img.shields.io/badge/tests-27%20passing-brightgreen.svg)](#testing)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ---
 
