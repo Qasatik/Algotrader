@@ -2,6 +2,8 @@
 .env
 *.env
 !*.env.example
+# Personal carry config (params only — keep the .example tracked)
+config/carry.toml
 
 # ---- Python --------------------------------------------------------
 __pycache__/

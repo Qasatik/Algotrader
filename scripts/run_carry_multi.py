@@ -35,6 +35,7 @@ import argparse
 import signal
 import time
 
+from config.loader import config_defaults_from_argv
 from core.carry_strategy import DEFAULT_TRADE_LOG, CarryAction, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
 from core.pnl_tracker import append_history as _pnl_append
@@ -118,6 +119,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--pnl-log", default=None,
                     help="append a net-worth snapshot (USDT+BTC) to this CSV "
                          "every --heartbeat polls (P&L tracking)")
+    ap.add_argument("--config", default=None,
+                    help="path to TOML config file (overrides built-in defaults; "
+                         "CLI flags still win)")
     return ap
 
 
@@ -214,7 +218,10 @@ def _confirm_mainnet(args: argparse.Namespace, symbols: list[str], n: int) -> bo
 
 
 def main() -> None:
-    args = _build_argparser().parse_args()
+    ap = _build_argparser()
+    # TOML file > built-in default; CLI flag > TOML file.
+    ap.set_defaults(**config_defaults_from_argv())
+    args = ap.parse_args()
 
     dynamic = args.top_n > 0
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]

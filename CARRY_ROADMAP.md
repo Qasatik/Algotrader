@@ -145,10 +145,12 @@ basis-guard.
 
 ## P3 — Усиление и операционка
 
-### 12. Конфиг-файл (TOML) вместо аргументов CLI  ⚪
-Долгоиграющим сервисам не нужна командная строка из 9 аргументов. Перенести
-дефолты [`CarryConfig`](core/carry_strategy.py:48) в `config/carry.toml`,
-загружаемый и раннером, и systemd-юнитом.
+### 12. Конфиг-файл (TOML) вместо аргументов CLI  ✅
+Долгоиграющим сервисам не нужна командная строка из 9 аргументов.
+[`config/loader.py`](config/loader.py:1) читает `config/carry.toml` (stdlib
+`tomllib`) и подставляет значения через `ArgumentParser.set_defaults()`.
+Приоритет: **CLI > TOML > дефолт**. Пример — [`config/carry.toml.example`](config/carry.toml.example:1).
+Оба раннера (`run_carry_testnet.py`, `run_carry_multi.py`) поддерживают `--config`.
 
 ### 13. Аудит прав API-ключа  ⚪
 Подтвердить, что у ключа **только Trade, БЕЗ выводов/переводов**. Добавить

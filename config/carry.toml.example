@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────
+# Carry bot configuration.  Copy to config/carry.toml and edit.
+#   cp config/carry.toml.example config/carry.toml
+#
+# Precedence:  CLI flag  >  this file  >  built-in default
+# Every CLI argument overrides the value here, so you can keep a base
+# config and tweak one-off runs from the command line.
+#
+# Run:  PYTHONPATH=. python3 scripts/run_carry_testnet.py --config config/carry.toml
+# ─────────────────────────────────────────────────────────────────────
+
+[strategy]
+symbol               = "BTCUSDT"     # trading pair (perp + spot must exist)
+leverage             = 2             # perp leverage (≤2× = conservative)
+equity_fraction      = 0.5           # notional = fraction × equity
+min_funding_to_open  = 0.0001        # open when funding ≥ 0.01% / 8h
+basis_guard_bps      = 50.0          # flatten if perp premium > 50 bps (0.5%)
+strong_funding       = 0.0003        # funding (0.03%) for full-confidence sizing
+size_mult_min        = 0.75          # size multiplier at zero confidence
+size_mult_max        = 1.25          # size multiplier at full confidence
+stop_loss_pct        = 15.0          # exchange-side SL: perp +15% (0 = off)
+max_hold_hours       = 0.0           # close after N hours (0 = unlimited)
+
+[runner]
+interval             = 5             # poll seconds (5 = fast basis-guard reaction)
+mainnet              = true          # LIVE REAL MONEY (set false for testnet)
+yes                  = true          # skip interactive mainnet confirmation
+flatten_on_exit      = false         # close position on shutdown?
+heartbeat            = 720           # polls between Telegram heartbeats
+no_notify            = false         # disable Telegram notifications?
+paper_equity         = 10000.0       # simulated equity for --dry-run sizing
+max_notional         = 70.0          # hard cap on position notional (USDT)
+pnl_log              = "data/carry_pnl.csv"  # net-worth history (USDT + BTC)
