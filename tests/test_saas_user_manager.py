@@ -120,7 +120,7 @@ def test_expired_subscription_downgrades_to_free_limits(mgr):
     refreshed = mgr.get_by_id(u.id)
     assert not refreshed.is_subscribed
     assert refreshed.effective_tier == Tier.FREE
-    assert refreshed.limits.max_notional == 50.0
+    assert refreshed.limits.max_notional == 100.0
 
 
 # ----------------------------------------------------------------- bot config

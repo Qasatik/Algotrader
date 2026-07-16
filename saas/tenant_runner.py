@@ -68,7 +68,17 @@ class TenantRunner:
     # ------------------------------------------------------------------ config
 
     def build_carry_config(self, user: User, bc: BotConfig) -> CarryConfig:
-        """Build a CarryConfig for *user*, clamping notional to their tier."""
+        """Build a CarryConfig for *user*, clamping all params to their tier.
+
+        Tier enforcement:
+            * ``max_notional`` → capped at tier limit (via resolved_max_notional).
+            * Rebalance → disabled (huge drift threshold) if tier doesn't allow it.
+        """
+        limits = user.limits
+        # If the tier doesn't allow rebalancing, set an unreachable drift
+        # threshold so _rebalance() never triggers.
+        rebalance_drift = 20.0 if limits.can_rebalance else 999_999.0
+
         return CarryConfig(
             leverage=bc.leverage,
             equity_fraction=bc.equity_fraction,
@@ -76,7 +86,31 @@ class TenantRunner:
             max_notional=bc.resolved_max_notional(user.effective_tier),
             min_notional=5.0,
             stop_loss_pct=bc.stop_loss_pct,
+            rebalance_drift_bps=rebalance_drift,
         )
+
+    def clamp_top_n(self, user: User, requested: int) -> int:
+        """Clamp the requested symbol count to the user's tier limit."""
+        return min(requested, user.limits.max_symbols)
+
+    def tier_violations(self, user: User, bc: BotConfig) -> list[str]:
+        """Return human-readable config violations vs tier limits.
+
+        Empty list = config is within tier bounds. Used by /config and
+        /start_bot to warn the user before applying changes.
+        """
+        limits = user.limits
+        issues: list[str] = []
+        if bc.top_n > limits.max_symbols:
+            issues.append(
+                f"top_n={bc.top_n} exceeds tier limit {limits.max_symbols}"
+            )
+        resolved = bc.resolved_max_notional(user.effective_tier)
+        if bc.max_notional is not None and bc.max_notional > resolved:
+            issues.append(
+                f"max_notional=${bc.max_notional:.0f} exceeds tier cap ${resolved:.0f}"
+            )
+        return issues
 
     # ------------------------------------------------------------- one poll
 

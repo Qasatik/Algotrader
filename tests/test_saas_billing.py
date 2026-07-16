@@ -236,7 +236,7 @@ class TestGateways:
         inv = billing.create_invoice(u.id, Tier.PRO)
         gw = ManualGateway()
         text = gw.payment_instructions(inv)
-        assert "6.00" in text or "16.00" in text
+        assert "8.00" in text  # PRO = $8/mo after price reduction
         assert str(inv.id) in text
 
     def test_usdt_gateway_instructions(self, billing_usdt):

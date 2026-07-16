@@ -29,6 +29,7 @@ models/*.pth
 data/*.parquet
 data/*.json
 data/*.csv
+data/*.log
 wandb/
 
 # ---- IDE / OS ------------------------------------------------------

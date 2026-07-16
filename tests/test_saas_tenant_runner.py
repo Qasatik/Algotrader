@@ -94,7 +94,7 @@ def test_free_tier_caps_notional(runner):
                      (time.time() - 1, u.id))
     bc = runner.mgr.get_bot_config(u.id)
     cfg = runner.build_carry_config(runner.mgr.get_by_id(u.id), bc)
-    assert cfg.max_notional == 50.0
+    assert cfg.max_notional == 100.0
 
 
 def test_pro_tier_allows_higher_notional(runner):

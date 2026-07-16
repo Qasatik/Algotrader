@@ -36,7 +36,7 @@ class TierLimits:
 
 
 _TIER_LIMITS: dict[Tier, TierLimits] = {
-    Tier.FREE: TierLimits(max_symbols=1, max_notional=50.0,
+    Tier.FREE: TierLimits(max_symbols=1, max_notional=100.0,
                           can_rebalance=False, advanced_alerts=False),
     Tier.BASIC: TierLimits(max_symbols=3, max_notional=500.0,
                            can_rebalance=False, advanced_alerts=True),

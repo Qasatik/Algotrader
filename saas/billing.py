@@ -26,11 +26,13 @@ from saas.models import Tier
 from saas.user_manager import UserManager
 
 #: Monthly subscription price per tier (USDT).
-#: Approximate conversions of 500 / 1500 / 3000 ₽ at ~85 ₽/$.
+#: Lowered to be viable for smaller accounts — a $200 account earning ~20%
+#: APR ($3.33/mo) can still justify a $3 BASIC subscription.
+#: Bybit affiliate (30% of trading fees) is a secondary passive revenue stream.
 PLAN_PRICES: dict[Tier, float] = {
-    Tier.BASIC: 6.0,
-    Tier.PRO: 16.0,
-    Tier.VIP: 30.0,
+    Tier.BASIC: 3.0,   # ~250 ₽/mo  — 3 symbols, $500 notional
+    Tier.PRO: 8.0,     # ~700 ₽/mo  — 10 symbols, $5000, rebalancing
+    Tier.VIP: 15.0,    # ~1300 ₽/mo — unlimited, priority support
 }
 
 #: How many days a subscription purchase grants.
