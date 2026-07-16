@@ -1,0 +1,57 @@
+name: Daily Code Review
+
+# Automated daily code-quality scan of the carry bot.
+# Runs the AST-based scripts/code_review.py (stdlib only) + ruff lint.
+# Informational only (continue-on-error) — never blocks PRs.
+
+on:
+  schedule:
+    # 09:00 UTC daily = 12:00 Moscow
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}  # manual "Run workflow" button
+  pull_request:
+    paths:
+      - "core/**"
+      - "scripts/**"
+      - "utils/**"
+      - "bot/**"
+      - "config/**"
+      - "backtest/**"
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: AST Code Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      # scripts/code_review.py uses only the stdlib (ast, re, pathlib) so it
+      # runs with zero project dependencies.
+      - name: Run AST code review
+        continue-on-error: true
+        run: |
+          python scripts/code_review.py | tee review.txt
+          {
+            echo "## 🔍 Code Review Report"
+            echo '```'
+            cat review.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ruff lint
+        continue-on-error: true
+        run: ruff check .
