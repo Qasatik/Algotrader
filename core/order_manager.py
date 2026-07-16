@@ -113,8 +113,9 @@ class OrderManager:
 
     async def _await_fill(self, order_id: str, timeout: float) -> bool:
         """Poll order status until filled or timeout (simplified)."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
             status = await asyncio.to_thread(self._order_status, order_id)
             if status in ("Filled", "PartiallyFilled"):
                 return True

@@ -315,6 +315,51 @@ def test_open_rolls_back_perp_if_spot_fails():
     assert close_call.args[0]["reduceOnly"] is True
 
 
+def test_open_failure_triggers_cooldown_no_churn():
+    """A failed spot leg must suppress re-opening (no open→rollback churn loop).
+
+    Reproduces the overnight bug: spot kept failing, so every poll re-opened a
+    perp short and emergency-closed it again — 70 opens, 10 rollbacks, burning
+    real orders/fees. After the fix the next decide() must return "none" while
+    the cooldown is active, and NO third order is placed.
+    """
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex.place_spot_order.side_effect = RuntimeError("spot failed")
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, open_fail_cooldown_s=600.0,
+    ))
+    act = s.decide()
+    assert act.action == "open"
+    with pytest.raises(RuntimeError, match="spot failed"):
+        s.execute(act)
+    # place_order called twice: open perp + emergency close. No third call.
+    assert ex.place_order.call_count == 2
+    # Immediately after the failure, decide() must NOT try to open again.
+    act2 = s.decide()
+    assert act2.action == "none"
+    assert "cooldown" in act2.reason.lower()
+    # Still only two orders — the churn loop is broken.
+    assert ex.place_order.call_count == 2
+
+
+def test_decide_survives_market_data_failure():
+    """A transient API error reading funding/spot must NOT crash the loop.
+
+    decide() should degrade to a no-op 'none' action (existing position left
+    untouched) instead of raising — otherwise one network hiccup kills the poll
+    and, in the runner, cascades into the error/backoff path every cycle.
+    """
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex.get_funding_rate.side_effect = RuntimeError("api down")
+    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
+    act = s.decide()
+    assert act.action == "none"
+    assert "market data unavailable" in act.reason
+    # State is unchanged — no phantom open/close.
+    assert s.state == CarryState.FLAT
+    assert ex.place_order.call_count == 0
+
+
 # ---------------- conviction sizing --------------------
 
 def test_high_confidence_sizes_up():
@@ -412,3 +457,105 @@ def test_reconcile_failed_read_returns_failed():
     msg = s.reconcile()
     assert msg.startswith("FAILED")
     assert s.state == CarryState.FLAT
+
+
+def test_reconcile_does_not_close_perp_on_spot_read_failure():
+    """C1: a transient spot-balance read failure must NOT close a hedged perp.
+
+    If get_wallet_balance raises while a perp short is open, the perp may well
+    be hedged by spot — emergency-closing it would leave a naked spot and
+    realise a loss.  reconcile() must refuse to trade (FAILED) and leave the
+    perp alone.  (Reproduces the overnight 'api down' + orphan_perp incident.)
+    """
+    ex = _mock_exchange(perp=65000.0, spot=65000.0, perp_size=0.001, spot_btc=0.001)
+    ex.get_wallet_balance.side_effect = RuntimeError("api down")
+    s = CarryStrategy(ex, CarryConfig())
+    msg = s.reconcile()
+    assert msg.startswith("FAILED")
+    assert "unreadable" in msg.lower()
+    # CRITICAL: no emergency close order placed — the perp is left untouched.
+    ex.place_order.assert_not_called()
+
+
+# ---------------- C2: state correctness on execution failure ----------------
+
+def test_close_failure_keeps_hedged_state():
+    """C2: a failed perp-close must NOT flip state to FLAT (phantom flat).
+
+    If the close order is rejected, the position is still genuinely HEDGED —
+    resetting state would make the next poll OPEN a duplicate.  _close() must
+    leave state HEDGED and return None (no trade-log row for a non-close).
+    """
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, exit_confirm_polls=1))
+    s.run_once()  # open
+    assert s.state == CarryState.HEDGED
+    # Severe negative funding → EV-gated close decision.
+    ex.get_funding_rate.return_value = {
+        "fundingRate": "-0.0004", "markPrice": "65000", "lastPrice": "65000"
+    }
+    act = s.decide()
+    assert act.action == "close"
+    # Now the perp close order is rejected.
+    ex.place_order.side_effect = RuntimeError("close rejected")
+    res = s.execute(act)
+    assert res is None  # close did not complete
+    assert s.state == CarryState.HEDGED  # still hedged — no phantom flat
+    assert s.position_qty > 0.0
+
+
+# ---------------- C3: fill verification + orderLinkId idempotency ------------
+
+def test_open_hedges_actual_perp_fill():
+    """C3: the spot hedge is sized to the REAL perp fill, not the requested qty.
+
+    A market order can partial-fill or be lot-rounded by the exchange.  Hedging
+    the requested qty would leave an unhedged delta; _open() reads the actual
+    perp size after the fill and hedges that.
+    """
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    # decide() computes qty 0.076 from equity, but the exchange fills only 0.070.
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
+    act = s.decide()
+    assert act.qty == 0.076
+    # Simulate the real (smaller) fill being readable post-open.
+    ex.get_positions.return_value = [
+        {"symbol": "BTCUSDT", "size": "0.070", "side": "Sell"}
+    ]
+    s.execute(act)
+    spot_qty = float(ex.place_spot_order.call_args.args[0]["qty"])
+    # 0.070 × 65000 = 4550 USDT (NOT 0.076 × 65000 = 4940)
+    assert spot_qty == pytest.approx(4550.0, abs=0.5)
+    assert s.position_qty == pytest.approx(0.070)
+
+
+def test_open_falls_back_to_requested_qty_when_fill_unreadable():
+    """C3: if the real fill can't be read, hedge the requested qty (best-effort)."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
+    act = s.decide()
+    assert act.qty == 0.076
+    # Position read fails post-open → must fall back to the requested qty.
+    ex.get_positions.side_effect = RuntimeError("read failed")
+    s.execute(act)
+    spot_qty = float(ex.place_spot_order.call_args.args[0]["qty"])
+    assert spot_qty == pytest.approx(0.076 * 65000.0, abs=0.5)
+
+
+def test_orders_carry_unique_orderlink_id():
+    """C3: every order carries a unique orderLinkId for traceability/idempotency."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
+    act = s.decide()
+    s.execute(act)
+    perp_order = ex.place_order.call_args.args[0]
+    spot_order = ex.place_spot_order.call_args.args[0]
+    assert perp_order["orderLinkId"]
+    assert spot_order["orderLinkId"]
+    assert perp_order["orderLinkId"] != spot_order["orderLinkId"]
+    # Bybit orderLinkId limit is 36 chars.
+    assert len(perp_order["orderLinkId"]) <= 36
+    assert len(spot_order["orderLinkId"]) <= 36

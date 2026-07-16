@@ -79,6 +79,10 @@ class CarryConfig:
     # Max hold time: close the position after this many hours regardless of
     # funding (prevents holding a decaying position forever). 0 = unlimited.
     max_hold_hours: float = 0.0
+    # Re-entry guard after a failed open (perp or spot leg rejected): wait this
+    # many seconds before trying again. Stops an open→rollback churn loop from
+    # burning orders/fees every poll when a leg keeps failing. 0 = disabled.
+    open_fail_cooldown_s: float = 600.0
 
     @property
     def base_coin(self) -> str:
@@ -121,6 +125,7 @@ class CarryStrategy:
         self._exit_signals: int = 0  # consecutive EV-warranted exit polls
         self._entry_time: float | None = None  # epoch seconds when position opened
         self._poll_count: int = 0  # total decide() calls (for throttling checks)
+        self._open_fail_until: float = 0.0  # epoch until which new opens are suppressed
 
     # ------------------------------------------------------------------
     # Startup reconciliation (P0-1)
@@ -143,17 +148,26 @@ class CarryStrategy:
             if p.get("symbol") == self.cfg.symbol:
                 perp_size = abs(_safe_float(p.get("size")))
                 break
-        spot_size = 0.0
+        # C1: distinguish "spot read FAILED" (None = unknown) from "spot is
+        # confirmed ZERO" (0.0). The old code used 0.0 for both, so a transient
+        # get_wallet_balance failure while a perp short was open looked exactly
+        # like an orphan/naked perp — and reconcile() emergency-closed it,
+        # liquidating a HEDGED position into a naked spot. We now refuse to
+        # trade when the hedge state is unreadable.
+        spot_size: float | None = None
         try:
             res = self.exchange.get_wallet_balance(self.cfg.base_coin)
             for c in res["list"][0]["coin"]:
                 if c.get("coin") == self.cfg.base_coin:
                     spot_size = _safe_float(c.get("walletBalance"))
                     break
-        except Exception:  # non-fatal: treat the spot leg as absent
-            pass
-        # Existing hedged pair (spot covers >= half the perp) → resume it.
-        if perp_size > 0 and spot_size >= perp_size * 0.5:
+            if spot_size is None:
+                spot_size = 0.0  # coin not held → confirmed zero
+        except Exception as exc:
+            log.error("carry_reconcile_spot_read_failed", error=str(exc))
+            # spot_size stays None → "unknown"; handled below.
+        # Existing hedged pair (spot read OK and covers >= half the perp) → resume.
+        if perp_size > 0 and spot_size is not None and spot_size >= perp_size * 0.5:
             self.state = CarryState.HEDGED
             self.position_qty = perp_size
             fr = self.exchange.get_funding_rate(self.cfg.symbol)
@@ -165,18 +179,34 @@ class CarryStrategy:
             self._entry_time = time.time()  # reset hold timer on resume
             log.info("carry_reconcile_hedged", perp=perp_size, spot=spot_size)
             return f"resumed HEDGED position (perp {perp_size}, spot {spot_size} BTC)"
-        # Orphaned perp short with no hedge = NAKED SHORT (dangerous) → flatten.
+        # Orphaned perp short. Only safe to flatten when we have CONFIRMED the
+        # spot hedge is absent — if the spot read failed we cannot tell naked
+        # from hedged, so we must NOT close (C1).
         if perp_size > 0:
+            if spot_size is None:
+                log.error(
+                    "carry_reconcile_spot_unknown_refuse_close",
+                    perp_size=perp_size,
+                )
+                self.state = CarryState.FLAT  # do not act on unknown state
+                return (
+                    "FAILED: perp short open but spot balance unreadable — "
+                    "refusing to close (position may be hedged). "
+                    "Investigate before trading."
+                )
             log.error("carry_reconcile_orphan_perp", perp_size=perp_size, spot_size=spot_size)
             self._emergency_close_perp(perp_size)
             self.state = CarryState.FLAT
             self.position_qty = 0.0
             return f"FLATTENED orphaned perp short {perp_size} (was unhedged!)"
         # Leftover spot long (dust from a partial close) — not dangerous; warn.
-        if spot_size > 0:
+        # Only assessable when the spot read succeeded.
+        if spot_size is not None and spot_size > 0:
             log.warning("carry_reconcile_orphan_spot", spot_size=spot_size)
             self.state = CarryState.FLAT
             return f"flat; note: leftover spot long {spot_size} BTC (ignored)"
+        if spot_size is None:
+            log.warning("carry_reconcile_spot_unreadable_no_perp")
         self.state = CarryState.FLAT
         log.info("carry_reconcile_flat")
         return "flat (no open position)"
@@ -251,10 +281,17 @@ class CarryStrategy:
         close/rebalance signals.
         """
         self._poll_count += 1
-        fr = self.exchange.get_funding_rate(self.cfg.symbol)
-        funding = _safe_float(fr.get("fundingRate"))
-        perp_price = _safe_float(fr.get("markPrice")) or _safe_float(fr.get("lastPrice"))
-        spot_price = self.exchange.get_spot_price(self.cfg.symbol) or perp_price or 0.0
+        # Fetch market data defensively: a transient API hiccup must degrade to
+        # a no-op poll, never crash the trading loop. An existing HEDGED
+        # position is left untouched and re-evaluated on the next poll.
+        try:
+            fr = self.exchange.get_funding_rate(self.cfg.symbol)
+            funding = _safe_float(fr.get("fundingRate"))
+            perp_price = _safe_float(fr.get("markPrice")) or _safe_float(fr.get("lastPrice"))
+            spot_price = self.exchange.get_spot_price(self.cfg.symbol) or perp_price or 0.0
+        except Exception as exc:
+            log.warning("decide_market_data_failed", error=str(exc))
+            return CarryAction("none", f"market data unavailable: {exc}")
         basis = _basis_bps(perp_price, spot_price)
 
         if self.state == CarryState.HEDGED:
@@ -273,8 +310,11 @@ class CarryStrategy:
         self._check_liq_proximity()
         # 1) Basis guard — short-squeeze liquidation protection (highest priority).
         if basis > self.cfg.basis_guard_bps:
+            # C2: flip state to FLAT (intent) but KEEP position_qty — it is
+            # zeroed only in _close() once the close is confirmed, so a failed
+            # close can restore HEDGED instead of opening a duplicate, and
+            # _close() actually knows how much to close.
             self.state = CarryState.FLAT
-            self.position_qty = 0.0
             return CarryAction(
                 "close",
                 f"basis guard {basis:.0f}bps > {self.cfg.basis_guard_bps:.0f}bps",
@@ -291,8 +331,7 @@ class CarryStrategy:
                 self._exit_signals += 1
                 if self._exit_signals >= self.cfg.exit_confirm_polls:
                     self._exit_signals = 0
-                    self.state = CarryState.FLAT
-                    self.position_qty = 0.0
+                    self.state = CarryState.FLAT  # intent only; _close() zeroes qty
                     return CarryAction(
                         "close",
                         f"EV exit: hold-loss {projected_loss_bps:.0f}bps > "
@@ -320,8 +359,7 @@ class CarryStrategy:
         if self.cfg.max_hold_hours > 0 and self._entry_time is not None:
             held_h = (time.time() - self._entry_time) / 3600.0
             if held_h >= self.cfg.max_hold_hours:
-                self.state = CarryState.FLAT
-                self.position_qty = 0.0
+                self.state = CarryState.FLAT  # intent only; _close() zeroes qty
                 return CarryAction(
                     "close",
                     f"max hold {held_h:.1f}h ≥ {self.cfg.max_hold_hours:.0f}h",
@@ -340,6 +378,16 @@ class CarryStrategy:
         return CarryAction("none", "holding", funding_rate=funding, basis_bps=basis)
 
     def _decide_flat(self, funding: float, basis: float, price: float) -> CarryAction:
+        # Re-entry guard: after a failed open (a leg was rejected), back off for
+        # open_fail_cooldown_s so a failing market can't trigger an open→rollback
+        # churn loop every poll. Existing HEDGED positions are unaffected (they
+        # route through _decide_hedged, not here).
+        if self._open_fail_until and time.time() < self._open_fail_until:
+            left = self._open_fail_until - time.time()
+            return CarryAction(
+                "none", f"open cooldown {left:.0f}s after failed open",
+                funding_rate=funding, basis_bps=basis,
+            )
         if funding < self.cfg.min_funding_to_open:
             return CarryAction(
                 "none", f"funding {funding*100:.4f}% < {self.cfg.min_funding_to_open*100:.4f}%",
@@ -411,31 +459,94 @@ class CarryStrategy:
         except OSError as exc:
             log.warning("trade_log_write_failed", error=str(exc))
 
+    def _arm_open_cooldown(self) -> None:
+        """Suppress new open attempts for ``open_fail_cooldown_s`` after a failure.
+
+        Without this, a persistently failing leg (e.g. the spot market rejected
+        the hedge, or the API is flapping) causes an open→rollback→re-open loop
+        every poll: each cycle places a real perp short, then emergency-closes
+        it — burning orders + fees and repeatedly opening an unhedged (orphan)
+        perp window. The cooldown breaks that loop.
+        """
+        if self.cfg.open_fail_cooldown_s > 0:
+            self._open_fail_until = time.time() + self.cfg.open_fail_cooldown_s
+            log.warning(
+                "carry_open_cooldown", seconds=self.cfg.open_fail_cooldown_s,
+            )
+
+    def _actual_perp_size(self) -> float:
+        """Read the REAL perp short size from the exchange (post-fill check).
+
+        Used to verify a fill before hedging (C3): a market order can partial-
+        fill or be lot-rounded by the exchange, so the spot hedge must be sized
+        to the ACTUAL position, not the requested qty.  Returns ``0.0`` if the
+        position can't be read — callers fall back to the requested qty then.
+        """
+        try:
+            for p in self.exchange.get_positions(self.cfg.symbol):
+                if p.get("symbol") == self.cfg.symbol:
+                    return abs(_safe_float(p.get("size")))
+        except Exception as exc:
+            log.warning("read_actual_perp_failed", error=str(exc))
+        return 0.0
+
+    def _order_link_id(self, leg: str) -> str:
+        """Unique client order id (≤36 chars) for traceability + idempotency.
+
+        Bybit's ``orderLinkId`` lets us deduplicate/retry safely and correlate
+        a fill back to a specific strategy action.  Unique per call (ms ts).
+        """
+        ts = int(time.time() * 1000)
+        return f"{self.cfg.symbol.lower()}-{leg}-{ts}"[-36:]
+
     def _open(self, act: CarryAction) -> dict:
         log.info(
             "carry_open", reason=act.reason, qty=act.qty,
             funding=act.funding_rate, basis_bps=act.basis_bps,
         )
         # Short the perpetual (market, reduce-only off — opening).
-        perp = self.exchange.place_order({
-            "symbol": self.cfg.symbol, "side": act.perp_side,
-            "orderType": "Market", "qty": str(act.qty),
-        })
+        # If the perp leg itself is rejected there is no position to roll back,
+        # but _decide_flat() already optimistically set state=HEDGED — undo it
+        # (C2: state must reflect REALITY, not intent) and arm the cooldown so
+        # we don't retry every poll.
+        try:
+            perp = self.exchange.place_order({
+                "symbol": self.cfg.symbol, "side": act.perp_side,
+                "orderType": "Market", "qty": str(act.qty),
+                "orderLinkId": self._order_link_id("open-perp"),
+            })
+        except Exception as exc:
+            log.error("carry_open_perp_failed", error=str(exc))
+            self._arm_open_cooldown()
+            self.state = CarryState.FLAT
+            self.position_qty = 0.0
+            raise
+        # C3: verify the REAL perp fill before sizing the spot hedge.  A market
+        # order can partial-fill or be lot-rounded by the exchange; hedging the
+        # REQUESTED qty instead of the ACTUAL fill leaves an unhedged delta.
+        # Fall back to the requested qty only if the position can't be read.
+        hedge_qty = self._actual_perp_size() or act.qty
+        if abs(hedge_qty - act.qty) > 1e-12:
+            log.info("carry_open_fill_adjusted", requested=act.qty, filled=hedge_qty)
+        self.position_qty = hedge_qty  # confirm to the real fill (C2)
         # Long the spot hedge.  Bybit V5 spot Market BUY takes qty in QUOTE
         # currency (USDT), not base (BTC) — so we convert qty_btc → USDT
         # notional.  (Market SELL still uses base-currency qty; see _close.)
         # CRITICAL: if the spot leg fails we must ROLL BACK the perp short
-        # immediately — an unhedged short has unlimited loss risk (squeeze).
+        # immediately — an unhedged short has unlimited loss risk (squeeze) —
+        # and arm the cooldown so the loop doesn't re-open straight away.
         price = act.spot_price or act.perp_price
-        spot_qty_usdt = round(act.qty * price, 2) if price > 0 else 0.0
+        spot_qty_usdt = round(hedge_qty * price, 2) if price > 0 else 0.0
         try:
             spot = self.exchange.place_spot_order({
                 "symbol": self.cfg.symbol, "side": act.spot_side,
                 "orderType": "Market", "qty": str(spot_qty_usdt),
+                "orderLinkId": self._order_link_id("open-spot"),
             })
         except Exception as exc:
             log.error("carry_open_spot_failed", error=str(exc))
-            self._emergency_close_perp(act.qty)
+            self._emergency_close_perp(hedge_qty)
+            self._arm_open_cooldown()
             self.state = CarryState.FLAT
             self.position_qty = 0.0
             raise
@@ -454,14 +565,30 @@ class CarryStrategy:
         except Exception as rb_exc:
             log.error("carry_open_rollback_failed", qty=qty, error=str(rb_exc))
 
-    def _close(self, act: CarryAction) -> dict:
+    def _close(self, act: CarryAction) -> dict | None:
         qty = act.qty or self.position_qty
         log.info("carry_close", qty=qty, reason=act.reason)
         # Buy back the perp short (reduceOnly ensures it only closes).
-        perp = self.exchange.place_order({
-            "symbol": self.cfg.symbol, "side": "Buy",
-            "orderType": "Market", "qty": str(qty), "reduceOnly": True,
-        })
+        # C2: if the perp close itself fails, we are STILL genuinely hedged — do
+        # NOT reset state to FLAT (that would create a phantom-flat and the next
+        # poll would try to OPEN a duplicate).  Log, leave state HEDGED, and let
+        # the next poll retry.  Return None so no trade-log row is written for a
+        # close that didn't actually happen.
+        try:
+            perp = self.exchange.place_order({
+                "symbol": self.cfg.symbol, "side": "Buy",
+                "orderType": "Market", "qty": str(qty), "reduceOnly": True,
+                "orderLinkId": self._order_link_id("close-perp"),
+            })
+        except Exception as exc:
+            log.error("carry_close_perp_failed", error=str(exc), qty=qty)
+            # C2: the close did NOT happen — decide() already optimistically
+            # flipped state to FLAT.  Restore HEDGED so the next poll retries
+            # the close instead of opening a duplicate on top of the still-
+            # open position.  position_qty was preserved by decide() (it is
+            # only zeroed on a successful close below).
+            self.state = CarryState.HEDGED
+            return None
         # Sell the spot long.  CRITICAL: the actual spot BTC balance is
         # slightly LESS than the perp qty because the spot taker fee (~0.1%)
         # was deducted from the received BTC at open time.  Selling the full
@@ -473,6 +600,7 @@ class CarryStrategy:
             spot = self.exchange.place_spot_order({
                 "symbol": self.cfg.symbol, "side": "Sell",
                 "orderType": "Market", "qty": str(round(sell_qty, 8)),
+                "orderLinkId": self._order_link_id("close-spot"),
             })
         except Exception as exc:
             # Perp is closed; leftover spot is not dangerous (no liquidation
