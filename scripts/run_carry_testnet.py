@@ -22,6 +22,7 @@ from core.carry_strategy import DEFAULT_TRADE_LOG, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
 from core.pnl_tracker import append_history as _pnl_append
 from core.pnl_tracker import snapshot as _pnl_snapshot
+from core.security import startup_audit as _startup_audit
 from utils.backoff import backoff_seconds as _backoff
 from utils.logger import get_logger
 from utils.notifier import is_configured as _tg_configured
@@ -79,6 +80,8 @@ def main() -> None:
     ap.add_argument("--config", default=None,
                     help="path to TOML config file (overrides built-in defaults; "
                          "CLI flags still win)")
+    ap.add_argument("--skip-api-audit", action="store_true",
+                    help="skip the startup API-key security audit (P3-13)")
     # TOML file > built-in default; CLI flag > TOML file.
     ap.set_defaults(**config_defaults_from_argv())
     args = ap.parse_args()
@@ -121,6 +124,9 @@ def main() -> None:
     elif args.mainnet:
         # LIVE REAL MONEY on the main Bybit exchange.
         exchange = BybitExchange(testnet=False)
+        # P3-13: API-key security audit — confirm no withdrawal/transfer perms.
+        if not _startup_audit(exchange, skip=args.skip_api_audit):
+            return
         exchange.set_leverage(args.symbol, args.leverage)
     else:
         # Default live mode uses the demo/testnet environment (no real money).

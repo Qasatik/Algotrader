@@ -152,11 +152,13 @@ basis-guard.
 Приоритет: **CLI > TOML > дефолт**. Пример — [`config/carry.toml.example`](config/carry.toml.example:1).
 Оба раннера (`run_carry_testnet.py`, `run_carry_multi.py`) поддерживают `--config`.
 
-### 13. Аудит прав API-ключа  ⚪
-Подтвердить, что у ключа **только Trade, БЕЗ выводов/переводов**. Добавить
-проверку при старте, предупреждающую, если скоуп ключа шире ожидаемого.
-(Пользователь сообщил «Unified Trading - Trade, SPOT - Trade» — хорошо, но
-проверить, что выводы отключены.)
+### 13. Аудит прав API-ключа  ✅
+[`core/security.py`](core/security.py:1) при старте запрашивает скоуп ключа
+через Bybit V5 `get_api_key_information` и проверяет: есть ли Trade-права,
+и **НЕТ** ли опасных (`Wallet`/`AccountTransfer`/`Withdraw`). Блокирует запуск
+на mainnet если ключ может двигать деньги; предупреждает если нет IP-whitelist
+или ключ скоро истекает. Текущий ключ: `Spot+Derivatives Trade`, `Wallet=[]` —
+✅ безопасен (выводов нет). Флаг `--skip-api-audit` для обхода. 11 тестов.
 
 ### 14. Логика реконнекта при длительных сбоях  ✅
 В `_request` есть tenacity-retry, но долгий сбой Bybit просто спамил ошибки.

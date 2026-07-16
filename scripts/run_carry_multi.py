@@ -40,6 +40,7 @@ from core.carry_strategy import DEFAULT_TRADE_LOG, CarryAction, CarryConfig, Car
 from core.exchange import BybitExchange
 from core.pnl_tracker import append_history as _pnl_append
 from core.pnl_tracker import snapshot as _pnl_snapshot
+from core.security import startup_audit as _startup_audit
 from utils.backoff import backoff_seconds
 from utils.logger import get_logger
 from utils.notifier import is_configured as _tg_configured
@@ -126,6 +127,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--config", default=None,
                     help="path to TOML config file (overrides built-in defaults; "
                          "CLI flags still win)")
+    ap.add_argument("--skip-api-audit", action="store_true",
+                    help="skip the startup API-key security audit (P3-13)")
     return ap
 
 
@@ -254,6 +257,12 @@ def main() -> None:
         exchange = BybitExchange(testnet=False)  # public data (dry) / live (mainnet)
     else:
         exchange = BybitExchange(testnet=True)
+
+    # P3-13: API-key security audit — confirm no withdrawal/transfer perms.
+    # Only meaningful on mainnet with real credentials (dry-run uses public data).
+    if args.mainnet and not args.dry_run:
+        if not _startup_audit(exchange, skip=args.skip_api_audit):
+            return
 
     if args.dry_run:
         total_equity = args.paper_equity

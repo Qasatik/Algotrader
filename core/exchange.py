@@ -188,6 +188,16 @@ class BybitExchange:
         except (KeyError, IndexError, TypeError, ValueError):
             return 0.0, []
 
+    def get_api_key_info(self) -> dict[str, Any]:
+        """Query the current API key's metadata + permission scope (P3-13).
+
+        Wraps Bybit V5 ``GET /v5/user/query-api``. Returns the raw ``result``
+        dict which includes ``permissions``, ``ips``, ``readOnly``, ``note``,
+        ``expiredAt`` etc. Used by the startup security audit to confirm the
+        key can trade but CANNOT withdraw / transfer funds.
+        """
+        return self._request("get_api_key_information")
+
     def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Current open positions."""
         res = self._request(

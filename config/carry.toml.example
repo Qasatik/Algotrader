@@ -31,3 +31,4 @@ no_notify            = false         # disable Telegram notifications?
 paper_equity         = 10000.0       # simulated equity for --dry-run sizing
 max_notional         = 70.0          # hard cap on position notional (USDT)
 pnl_log              = "data/carry_pnl.csv"  # net-worth history (USDT + BTC)
+skip_api_audit       = false        # skip startup API-key security audit? (P3-13)
