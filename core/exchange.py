@@ -39,7 +39,10 @@ class BybitExchange:
     inside an asyncio executor (see ``async_to_thread`` usage in callers).
     """
 
-    def __init__(self, testnet: bool | None = None) -> None:
+    def __init__(
+        self, testnet: bool | None = None,
+        api_key: str | None = None, api_secret: str | None = None,
+    ) -> None:
         """Build the HTTP session.
 
         Args:
@@ -47,6 +50,9 @@ class BybitExchange:
                 comes from settings and ``assert_ready_for_live`` is enforced.
                 Pass ``False`` to read *public* mainnet market data (klines,
                 tickers) without credentials — used by the data pipeline.
+            api_key / api_secret: Explicit credentials (multi-tenant SaaS —
+                one exchange per user with their own BYOK keys). When omitted,
+                credentials fall back to the global settings/env.
         """
         s = get_settings()
         if testnet is None:
@@ -54,8 +60,8 @@ class BybitExchange:
             s.assert_ready_for_live()
         self._session: HTTP = HTTP(
             testnet=testnet,
-            api_key=s.bybit_api_key or None,
-            api_secret=s.bybit_api_secret or None,
+            api_key=api_key or s.bybit_api_key or None,
+            api_secret=api_secret or s.bybit_api_secret or None,
             recv_window=5000,
             timeout=s.http_timeout,
         )
