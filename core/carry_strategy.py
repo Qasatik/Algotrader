@@ -83,6 +83,11 @@ class CarryConfig:
     # many seconds before trying again. Stops an open→rollback churn loop from
     # burning orders/fees every poll when a leg keeps failing. 0 = disabled.
     open_fail_cooldown_s: float = 600.0
+    # Spot taker fee rate (P3-15 hedge precision). Bybit deducts the fee from
+    # the RECEIVED base coin, so a naive hedge_qty×price USDT order leaves the
+    # spot leg ~fee% shorter than the perp short → a small unhedged delta. We
+    # gross up the USDT order by 1/(1-fee) so the NET received BTC matches.
+    spot_taker_fee: float = 0.001  # 0.1% (Bybit VIP0 spot taker)
 
     @property
     def base_coin(self) -> str:
@@ -536,7 +541,12 @@ class CarryStrategy:
         # immediately — an unhedged short has unlimited loss risk (squeeze) —
         # and arm the cooldown so the loop doesn't re-open straight away.
         price = act.spot_price or act.perp_price
-        spot_qty_usdt = round(hedge_qty * price, 2) if price > 0 else 0.0
+        # P3-15: gross up the USDT order by 1/(1-fee) so the NET received BTC
+        # (after the spot taker fee is deducted from the base coin) matches the
+        # perp short size exactly — keeping the hedge truly delta-neutral.
+        fee = self.cfg.spot_taker_fee
+        gross = hedge_qty * price / (1.0 - fee) if fee > 0 else hedge_qty * price
+        spot_qty_usdt = round(gross, 2) if price > 0 else 0.0
         try:
             spot = self.exchange.place_spot_order({
                 "symbol": self.cfg.symbol, "side": act.spot_side,

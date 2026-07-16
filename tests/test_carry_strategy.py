@@ -517,7 +517,8 @@ def test_open_hedges_actual_perp_fill():
     ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
     # decide() computes qty 0.076 from equity, but the exchange fills only 0.070.
     s = CarryStrategy(ex, CarryConfig(
-        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
+        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0,
+        spot_taker_fee=0.0))  # isolate C3 fill check from P3-15 fee gross-up
     act = s.decide()
     assert act.qty == 0.076
     # Simulate the real (smaller) fill being readable post-open.
@@ -535,7 +536,8 @@ def test_open_falls_back_to_requested_qty_when_fill_unreadable():
     """C3: if the real fill can't be read, hedge the requested qty (best-effort)."""
     ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
-        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
+        equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0,
+        spot_taker_fee=0.0))  # isolate C3 fill check from P3-15 fee gross-up
     act = s.decide()
     assert act.qty == 0.076
     # Position read fails post-open → must fall back to the requested qty.
@@ -559,3 +561,38 @@ def test_orders_carry_unique_orderlink_id():
     # Bybit orderLinkId limit is 36 chars.
     assert len(perp_order["orderLinkId"]) <= 36
     assert len(spot_order["orderLinkId"]) <= 36
+
+
+# ---------------- P3-15: hedge precision (fee gross-up) ----------------
+
+def test_open_grosses_up_spot_for_taker_fee():
+    """P3-15: the spot USDT order is grossed up by 1/(1-fee) so the NET
+    received BTC (after the taker fee deducted from the base coin) matches
+    the perp short size, keeping the hedge truly delta-neutral.
+    """
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001,
+        size_mult_min=1.0, size_mult_max=1.0,
+        spot_taker_fee=0.001))  # 0.1%
+    act = s.decide()
+    assert act.qty == 0.076
+    s.execute(act)
+    spot_qty = float(ex.place_spot_order.call_args.args[0]["qty"])
+    # 0.076 × 65000 / (1 - 0.001) = 4944.94... (NOT 4940.0)
+    expected = 0.076 * 65000.0 / 0.999
+    assert spot_qty == pytest.approx(expected, abs=0.5)
+
+
+def test_open_no_grossup_when_fee_zero():
+    """P3-15: with spot_taker_fee=0 the order is the plain hedge_qty×price."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001,
+        size_mult_min=1.0, size_mult_max=1.0,
+        spot_taker_fee=0.0))
+    act = s.decide()
+    s.execute(act)
+    spot_qty = float(ex.place_spot_order.call_args.args[0]["qty"])
+    # 0.076 × 65000 = 4940.0 (no gross-up)
+    assert spot_qty == pytest.approx(0.076 * 65000.0, abs=0.5)
