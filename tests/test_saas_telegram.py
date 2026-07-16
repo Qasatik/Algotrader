@@ -1,152 +1,468 @@
-"""Smoke tests for the multi-tenant Telegram SaaS bot command handlers.
+"""Tests for the SaaS user-facing Telegram bot (saas/telegram_saas.py).
 
-Skipped when python-telegram-bot isn't installed (it's a heavy optional dep;
-the core SaaS logic is tested independently).
+Uses lightweight mock objects for ``Update`` / ``ContextTypes`` so we can
+test the command handlers without a real Telegram connection.
 """
+from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from dataclasses import dataclass, field
 
 import pytest
 
-pytest.importorskip("telegram")  # skip whole module if python-telegram-bot absent
+from saas.billing import BillingService, UsdtGateway
+from saas.database import Database
+from saas.models import Tier
+from saas.telegram_saas import SaaSTelegramBot, _md_to_html
+from saas.user_manager import UserManager
 
-from bot.telegram_saas import TelegramSaaSBot  # noqa: E402
-from saas import crypto  # noqa: E402
-from saas.database import Database  # noqa: E402
-from saas.tenant_runner import TenantRunner  # noqa: E402
-from saas.user_manager import UserManager  # noqa: E402
+_MASTER = "test-master-secret-for-unit-tests"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Mock Telegram objects
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class _MockUser:
+    id: int
+    username: str = ""
+
+
+@dataclass
+class _MockMessage:
+    replies: list[str] = field(default_factory=list)
+
+    async def reply_text(self, text: str, parse_mode=None) -> None:
+        self.replies.append(text)
+
+
+@dataclass
+class _MockBot:
+    username: str = "algotrader_test_bot"
+
+
+@dataclass
+class _MockContext:
+    args: list[str] = field(default_factory=list)
+    bot: _MockBot = field(default_factory=_MockBot)
+
+
+def _make_update(uid: int, username: str = "tester") -> tuple:
+    """Return ``(update, ctx)`` mock pair for a given Telegram user."""
+    msg = _MockMessage()
+    update = _MockUpdateContainer(
+        effective_user=_MockUser(id=uid, username=username),
+        message=msg,
+    )
+    ctx = _MockContext()
+    return update, ctx
+
+
+@dataclass
+class _MockUpdateContainer:
+    effective_user: _MockUser
+    message: _MockMessage
+
+
+def _run(coro):
+    """Run an async coroutine synchronously (no pytest-asyncio needed)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fixtures
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.fixture()
 def bot(tmp_path):
-    db = Database(str(tmp_path / "tg.db"))
+    """A SaaSTelegramBot wired to a temp DB + USDT gateway."""
+    db = Database(str(tmp_path / "saas.db"))
     db.init()
-    mgr = UserManager(db, crypto.generate_master_secret())
-    runner = TenantRunner(mgr, exchange_factory=lambda k, s: MagicMock())
-    return TelegramSaaSBot("fake-token", mgr, runner)
+    mgr = UserManager(db, _MASTER)
+    gateway = UsdtGateway("TTestWallet123")
+    billing = BillingService(db, mgr, gateway)
+    return SaaSTelegramBot(
+        token="123:test-token", mgr=mgr, billing=billing,
+        admin_ids=[999],
+    )
 
 
-def _mock_update(tid=999, username="tester", args=None):
-    """Build a mock telegram.Update with an awaitable reply_text."""
-    update = MagicMock()
-    update.effective_user.id = tid
-    update.effective_user.username = username
-    update.message.reply_text = AsyncMock()
-    update.message.delete = AsyncMock()
-    ctx = MagicMock()
-    ctx.args = args or []
-    ctx.bot.username = "carrybot"
-    return update, ctx
+# ═══════════════════════════════════════════════════════════════════════════
+# /start — registration & greeting
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+class TestStart:
+    def test_registers_new_user(self, bot):
+        update, ctx = _make_update(111, "alice")
+        _run(bot._cmd_start(update, ctx))
+        user = bot.mgr.get_by_telegram_id(111)
+        assert user is not None
+        assert user.username == "alice"
+        assert user.tier == Tier.FREE
+        assert "AlgoTrader" in update.message.replies[0]
+
+    def test_greets_returning_user(self, bot):
+        # First /start registers.
+        update, ctx = _make_update(222, "bob")
+        _run(bot._cmd_start(update, ctx))
+        # Second /start greets (no duplicate).
+        update2, ctx2 = _make_update(222, "bob")
+        _run(bot._cmd_start(update2, ctx2))
+        user = bot.mgr.get_by_telegram_id(222)
+        assert user is not None
+        assert "AlgoTrader" in update2.message.replies[0]
+
+    def test_referral_deep_link(self, bot):
+        # Alice registers first, gets a referral code.
+        u_alice, _ = _make_update(111, "alice")
+        _run(bot._cmd_start(u_alice, _MockContext()))
+        alice = bot.mgr.get_by_telegram_id(111)
+        assert alice is not None
+        assert alice.referral_code
+
+        # Bob starts with Alice's referral code.
+        u_bob, ctx_bob = _make_update(222, "bob")
+        ctx_bob.args = [f"ref_{alice.referral_code}"]
+        _run(bot._cmd_start(u_bob, ctx_bob))
+        bob = bot.mgr.get_by_telegram_id(222)
+        assert bob is not None
+        assert bob.referred_by == alice.id
 
 
-# ----------------------------------------------------------------- /start
+# ═══════════════════════════════════════════════════════════════════════════
+# /pricing
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_start_registers_new_user(bot):
-    upd, ctx = _mock_update(tid=5001)
-    _run(bot._cmd_start(upd, ctx))
-    user = bot.mgr.get_by_telegram_id(5001)
-    assert user is not None
-    assert user.is_subscribed  # trial active
-    assert len(user.referral_code) == 8
-    upd.message.reply_text.assert_awaited_once()
+class TestPricing:
+    def test_shows_all_tiers(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_pricing(update, ctx))
+        text = update.message.replies[0]
+        assert "BASIC" in text
+        assert "PRO" in text
+        assert "VIP" in text
+        assert "3" in text   # $3 basic
+        assert "8" in text   # $8 pro
+        assert "15" in text  # $15 vip
 
 
-def test_start_with_referral(bot):
-    boss = bot.mgr.register(1, "boss")
-    upd, ctx = _mock_update(tid=5002, args=[boss.referral_code])
-    _run(bot._cmd_start(upd, ctx))
-    invited = bot.mgr.get_by_telegram_id(5002)
-    assert invited.referred_by == boss.id
+# ═══════════════════════════════════════════════════════════════════════════
+# /subscribe
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_start_welbacks_existing_user(bot):
-    bot.mgr.register(5003, "returning")
-    upd, ctx = _mock_update(tid=5003, username="returning")
-    _run(bot._cmd_start(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert "С возвращением" in text
+class TestSubscribe:
+    def test_creates_invoice_for_pro(self, bot):
+        update, ctx = _make_update(111)
+        ctx.args = ["pro"]
+        _run(bot._cmd_subscribe(update, ctx))
+        text = update.message.replies[0]
+        assert "Счёт" in text
+        assert "PRO" in text
+        # Invoice should exist in DB.
+        inv = bot.billing.pending_invoice(
+            bot.mgr.get_by_telegram_id(111).id
+        )
+        assert inv is not None
+        assert inv.plan == "pro"
+        assert inv.amount_usdt == 8.0
+
+    def test_creates_invoice_for_basic(self, bot):
+        update, ctx = _make_update(111)
+        ctx.args = ["basic"]
+        _run(bot._cmd_subscribe(update, ctx))
+        inv = bot.billing.pending_invoice(
+            bot.mgr.get_by_telegram_id(111).id
+        )
+        assert inv is not None
+        assert inv.amount_usdt == 3.0
+
+    def test_no_args_shows_usage(self, bot):
+        update, ctx = _make_update(111)
+        ctx.args = []
+        _run(bot._cmd_subscribe(update, ctx))
+        assert "Укажите тариф" in update.message.replies[0]
+
+    def test_free_tier_rejected(self, bot):
+        update, ctx = _make_update(111)
+        ctx.args = ["free"]
+        _run(bot._cmd_subscribe(update, ctx))
+        assert "FREE" in update.message.replies[0]
+        assert "бесплатный" in update.message.replies[0].lower()
+
+    def test_invalid_tier_rejected(self, bot):
+        update, ctx = _make_update(111)
+        ctx.args = ["diamond"]
+        _run(bot._cmd_subscribe(update, ctx))
+        assert "Неизвестный тариф" in update.message.replies[0]
+
+    def test_invoice_has_usdt_instructions(self, bot):
+        update, ctx = _make_update(111)
+        ctx.args = ["vip"]
+        _run(bot._cmd_subscribe(update, ctx))
+        text = update.message.replies[0]
+        assert "TRC-20" in text
+        assert "TTestWallet123" in text
 
 
-# ----------------------------------------------------------------- /status
+# ═══════════════════════════════════════════════════════════════════════════
+# /pay
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_status_requires_registration(bot):
-    upd, ctx = _mock_update(tid=5004)
-    _run(bot._cmd_status(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert "/start" in text
+class TestPay:
+    def test_shows_pending_invoice(self, bot):
+        # Register + create invoice.
+        u1, c1 = _make_update(111)
+        _run(bot._cmd_start(u1, _MockContext()))
+        c1.args = ["pro"]
+        _run(bot._cmd_subscribe(u1, c1))
+
+        # /pay shows the pending invoice.
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_pay(u2, c2))
+        text = u2.message.replies[0]
+        assert "Счёт" in text
+        assert "PRO" in text
+        assert "TRC-20" in text
+
+    def test_no_pending_invoice(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_pay(update, ctx))
+        assert "нет ожидающих" in update.message.replies[-1].lower()
 
 
-def test_status_shows_tier(bot):
-    bot.mgr.register(5005, "statuser")
-    upd, ctx = _mock_update(tid=5005)
-    _run(bot._cmd_status(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert "free" in text.lower()
+# ═══════════════════════════════════════════════════════════════════════════
+# /invoices
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-# ----------------------------------------------------------------- /start_bot
+class TestInvoices:
+    def test_empty_invoices(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_invoices(update, ctx))
+        assert "нет счетов" in update.message.replies[-1].lower()
+
+    def test_lists_created_invoice(self, bot):
+        u1, c1 = _make_update(111)
+        _run(bot._cmd_start(u1, _MockContext()))
+        c1.args = ["pro"]
+        _run(bot._cmd_subscribe(u1, c1))
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_invoices(u2, c2))
+        text = u2.message.replies[-1]
+        assert "PRO" in text
+        assert "8" in text  # $8
 
 
-def test_start_bot_requires_api_key(bot):
-    bot.mgr.register(5006, "nokeys")
-    upd, ctx = _mock_update(tid=5006)
-    _run(bot._cmd_start_bot(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert "API" in text or "connect" in text
+# ═══════════════════════════════════════════════════════════════════════════
+# /myplan
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_start_bot_requires_subscription(bot):
-    import time
-    u = bot.mgr.register(5007, "expired")
-    bot.mgr.connect_api_key(u.id, "k", "s")
-    with bot.mgr.db.connect() as conn:
-        conn.execute("UPDATE users SET subscription_until=? WHERE id=?",
-                     (time.time() - 1, u.id))
-    upd, ctx = _mock_update(tid=5007)
-    _run(bot._cmd_start_bot(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert "истекла" in text or "pricing" in text
+class TestMyPlan:
+    def test_shows_free_tier(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_myplan(update, ctx))
+        text = update.message.replies[-1]
+        assert "FREE" in text
+        assert "100" in text  # max_notional for free
+        assert "не подключён" in text  # no API key
+
+    def test_shows_paid_tier_after_upgrade(self, bot):
+        u1, c1 = _make_update(111)
+        _run(bot._cmd_start(u1, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+
+        # Simulate payment → PRO.
+        inv = bot.billing.create_invoice(user.id, Tier.PRO)
+        bot.billing.confirm_payment(inv.id, "tx_test")
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_myplan(u2, c2))
+        text = u2.message.replies[-1]
+        assert "PRO" in text
+        assert "5000" in text  # max_notional for PRO
 
 
-def test_start_bot_success(bot):
-    u = bot.mgr.register(5008, "ready")
-    bot.mgr.connect_api_key(u.id, "k", "s")
-    upd, ctx = _mock_update(tid=5008)
-    _run(bot._cmd_start_bot(upd, ctx))
-    refreshed = bot.mgr.get_by_id(u.id)
-    assert refreshed.bot_enabled is True
+# ═══════════════════════════════════════════════════════════════════════════
+# /referral
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-# ----------------------------------------------------------------- /referral
+class TestReferral:
+    def test_shows_referral_code(self, bot):
+        update, ctx = _make_update(111, "alice")
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_referral(update, ctx))
+        text = update.message.replies[-1]
+        user = bot.mgr.get_by_telegram_id(111)
+        assert user.referral_code in text
+        assert "algotrader_test_bot" in text  # bot username in link
+        assert "0" in text  # 0 invited, 0 earned
+
+    def test_shows_earnings_after_referral_pays(self, bot):
+        # Alice registers.
+        u_a, _ = _make_update(111, "alice")
+        _run(bot._cmd_start(u_a, _MockContext()))
+        alice = bot.mgr.get_by_telegram_id(111)
+
+        # Bob registers with Alice's code.
+        u_b, c_b = _make_update(222, "bob")
+        c_b.args = [f"ref_{alice.referral_code}"]
+        _run(bot._cmd_start(u_b, c_b))
+        bob = bot.mgr.get_by_telegram_id(222)
+
+        # Bob pays.
+        inv = bot.billing.create_invoice(bob.id, Tier.PRO)
+        bot.billing.confirm_payment(inv.id, "tx1")
+
+        # Alice checks referral.
+        u_a2, c_a2 = _make_update(111, "alice")
+        _run(bot._cmd_referral(u_a2, c_a2))
+        text = u_a2.message.replies[-1]
+        assert "1" in text  # 1 invited
+        assert "0.80" in text  # 10% of $8 = $0.80
 
 
-def test_referral_shows_code(bot):
-    u = bot.mgr.register(5009, "referrer")
-    upd, ctx = _mock_update(tid=5009)
-    _run(bot._cmd_referral(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert u.referral_code in text
+# ═══════════════════════════════════════════════════════════════════════════
+# /admin_pay
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-# ----------------------------------------------------------------- /connect
+class TestAdminPay:
+    def test_admin_confirms_payment(self, bot):
+        # User creates invoice.
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        inv = bot.billing.create_invoice(user.id, Tier.BASIC)
+
+        # Admin confirms.
+        a, ca = _make_update(999, "admin")  # 999 is admin
+        ca.args = [str(inv.id)]
+        _run(bot._cmd_admin_pay(a, ca))
+        text = a.message.replies[-1]
+        assert "оплачен" in text.lower()
+        assert "BASIC" in text
+
+        # Verify subscription extended.
+        refreshed = bot.mgr.get_by_id(user.id)
+        assert refreshed.tier == Tier.BASIC
+        assert refreshed.is_subscribed
+
+    def test_non_admin_denied(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        inv = bot.billing.create_invoice(user.id, Tier.PRO)
+
+        # Non-admin (uid=222) tries to confirm.
+        a, ca = _make_update(222, "hacker")
+        ca.args = [str(inv.id)]
+        _run(bot._cmd_admin_pay(a, ca))
+        assert "администратора" in a.message.replies[-1]
+
+        # Invoice should still be pending.
+        check = bot.billing.get_invoice(inv.id)
+        assert check.status.value == "pending"
+
+    def test_no_args_shows_usage(self, bot):
+        a, ca = _make_update(999, "admin")
+        ca.args = []
+        _run(bot._cmd_admin_pay(a, ca))
+        assert "Использование" in a.message.replies[-1]
+
+    def test_non_numeric_id(self, bot):
+        a, ca = _make_update(999, "admin")
+        ca.args = ["abc"]
+        _run(bot._cmd_admin_pay(a, ca))
+        assert "числом" in a.message.replies[-1]
+
+    def test_nonexistent_invoice(self, bot):
+        a, ca = _make_update(999, "admin")
+        ca.args = ["99999"]
+        _run(bot._cmd_admin_pay(a, ca))
+        assert "не найден" in a.message.replies[-1]
+
+    def test_double_confirm_idempotent(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        inv = bot.billing.create_invoice(user.id, Tier.PRO)
+
+        # First confirm.
+        a1, ca1 = _make_update(999, "admin")
+        ca1.args = [str(inv.id)]
+        _run(bot._cmd_admin_pay(a1, ca1))
+        assert "оплачен" in a1.message.replies[-1].lower()
+
+        # Second confirm → "already processed".
+        a2, ca2 = _make_update(999, "admin")
+        ca2.args = [str(inv.id)]
+        _run(bot._cmd_admin_pay(a2, ca2))
+        assert "уже был обработан" in a2.message.replies[-1]
 
 
-def test_connect_usage_hint(bot):
-    bot.mgr.register(5010, "newbie")
-    upd, ctx = _mock_update(tid=5010, args=[])  # no args
-    _run(bot._cmd_connect(upd, ctx))
-    text = upd.message.reply_text.call_args.args[0]
-    assert "connect" in text.lower()
+# ═══════════════════════════════════════════════════════════════════════════
+# /help
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_handlers_registered(bot):
-    """All 8 commands are wired into the application."""
-    # python-telegram-bot stores handlers internally; check the builder worked.
-    assert bot.app is not None
+class TestHelp:
+    def test_lists_commands(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_help(update, ctx))
+        text = update.message.replies[-1]
+        assert "/pricing" in text
+        assert "/subscribe" in text
+        assert "/referral" in text
+
+    def test_admin_sees_admin_commands(self, bot):
+        update, ctx = _make_update(999, "admin")
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_help(update, ctx))
+        text = update.message.replies[-1]
+        assert "/admin_pay" in text
+
+    def test_non_admin_no_admin_commands(self, bot):
+        update, ctx = _make_update(111)
+        _run(bot._cmd_start(update, _MockContext()))
+        _run(bot._cmd_help(update, ctx))
+        text = update.message.replies[-1]
+        assert "/admin_pay" not in text
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Utility: _md_to_html
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMdToHtml:
+    def test_converts_backticks(self):
+        assert _md_to_html("`hello`") == "<code>hello</code>"
+
+    def test_converts_multiple(self):
+        result = _md_to_html("addr: `abc` memo: `xyz`")
+        assert "<code>abc</code>" in result
+        assert "<code>xyz</code>" in result
+
+    def test_no_backticks_unchanged(self):
+        assert _md_to_html("plain text") == "plain text"
