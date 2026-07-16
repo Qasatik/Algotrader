@@ -40,6 +40,7 @@ from core.carry_strategy import DEFAULT_TRADE_LOG, CarryAction, CarryConfig, Car
 from core.exchange import BybitExchange
 from core.pnl_tracker import append_history as _pnl_append
 from core.pnl_tracker import snapshot as _pnl_snapshot
+from utils.backoff import backoff_seconds
 from utils.logger import get_logger
 from utils.notifier import is_configured as _tg_configured
 from utils.notifier import notify as _notify
@@ -116,6 +117,9 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="exchange-side stop-loss %% from entry (default 15%%, 0=off)")
     ap.add_argument("--max-hold-hours", type=float, default=0.0,
                     help="close position after this many hours (default 0=unlimited)")
+    ap.add_argument("--open-fail-cooldown", type=float, default=600.0,
+                    help="seconds to wait before retrying after a failed open "
+                         "(default 600; prevents open/rollback churn loops)")
     ap.add_argument("--pnl-log", default=None,
                     help="append a net-worth snapshot (USDT+BTC) to this CSV "
                          "every --heartbeat polls (P&L tracking)")
@@ -146,6 +150,7 @@ def _make_strategy(
         size_mult_max=args.size_mult_max,
         stop_loss_pct=args.stop_loss_pct,
         max_hold_hours=args.max_hold_hours,
+        open_fail_cooldown_s=args.open_fail_cooldown,
         qty_step=qty_step,
         # Fix per-slot equity so one slot's open doesn't shrink the sizing
         # base for the others (and stays stable across rotations).
@@ -359,11 +364,16 @@ def main() -> None:
             except Exception as exc:
                 log.warning("pnl_snapshot_failed", error=str(exc))
 
-        # Sleep in small increments so SIGINT is responsive
-        for _ in range(args.interval):
-            if not _running:
-                break
-            time.sleep(1)
+        # Sleep so SIGINT stays responsive. When the exchange is unreachable
+        # (consecutive errors), back off exponentially instead of hammering it
+        # at the normal cadence — avoids rate-limiting and log/request spam.
+        sleep_s = backoff_seconds(_consecutive_errors, base=args.interval)
+        if sleep_s != args.interval:
+            log.info("poll_backoff", seconds=sleep_s, errors=_consecutive_errors)
+        slept = 0.0
+        while _running and slept < sleep_s:
+            time.sleep(min(1.0, sleep_s - slept))
+            slept += 1.0
 
     # ------------------------------------------------------------------
     # Graceful shutdown

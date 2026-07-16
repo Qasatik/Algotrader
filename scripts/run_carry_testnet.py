@@ -22,6 +22,7 @@ from core.carry_strategy import DEFAULT_TRADE_LOG, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
 from core.pnl_tracker import append_history as _pnl_append
 from core.pnl_tracker import snapshot as _pnl_snapshot
+from utils.backoff import backoff_seconds as _backoff
 from utils.logger import get_logger
 from utils.notifier import is_configured as _tg_configured
 from utils.notifier import notify as _notify
@@ -213,8 +214,10 @@ def main() -> None:
             except Exception as exc:
                 log.warning("pnl_snapshot_failed", error=str(exc))
 
-        # sleep in small increments so SIGINT is responsive
-        for _ in range(args.interval):
+        # Sleep in small increments so SIGINT is responsive. Back off
+        # exponentially on sustained errors so a down exchange isn't hammered.
+        _sleep = int(_backoff(_consecutive_errors, args.interval))
+        for _ in range(_sleep):
             if not _running:
                 break
             time.sleep(1)
