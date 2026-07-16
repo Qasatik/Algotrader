@@ -95,6 +95,8 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="open when funding >= this (default 0.01%%)")
     ap.add_argument("--max-notional", type=float, default=None,
                     help="hard cap on position notional USDT PER SLOT (safety)")
+    ap.add_argument("--min-notional", type=float, default=5.0,
+                    help="skip open when notional < this USDT (Bybit spot min ~$5)")
     ap.add_argument("--dry-run", action="store_true", help="decide only, no orders")
     ap.add_argument("--mainnet", action="store_true",
                     help="LIVE REAL MONEY on mainnet (requires confirmation)")
@@ -148,6 +150,7 @@ def _make_strategy(
         basis_guard_bps=args.basis_guard_bps,
         min_funding_to_open=args.min_funding,
         max_notional=args.max_notional,
+        min_notional=args.min_notional,
         strong_funding=args.strong_funding,
         size_mult_min=args.size_mult_min,
         size_mult_max=args.size_mult_max,
@@ -266,13 +269,29 @@ def main() -> None:
 
     if args.dry_run:
         total_equity = args.paper_equity
+        free_equity = total_equity
     else:
         try:
             res = exchange.get_wallet_balance("USDT")
-            total_equity = float(res["list"][0]["coin"][0].get("walletBalance", 0.0))
+            coin = res["list"][0]["coin"][0]
+            total_equity = float(coin.get("walletBalance", 0.0))
+            # Margin already locked in open perp positions is NOT available for
+            # new spot buys. Size from the truly free balance so existing
+            # hedges don't make the bot attempt opens it can't afford
+            # (Bybit rejects with "Insufficient balance" ErrCode 170131).
+            locked_im = float(coin.get("totalPositionIM", 0.0))
+            free_equity = max(total_equity - locked_im, 0.0)
         except Exception:
             total_equity = 0.0
-    per_slot_equity = total_equity / n if n > 0 else 0.0
+            free_equity = 0.0
+    per_slot_equity = free_equity / n if n > 0 else 0.0
+    print(f"  capital: wallet ${total_equity:.2f} - locked margin "
+          f"${total_equity - free_equity:.2f} = free ${free_equity:.2f} "
+          f"→ ${per_slot_equity:.2f}/slot × {n}")
+    if not args.dry_run and per_slot_equity * args.equity_fraction < args.min_notional:
+        print(f"  ⚠️  free capital too low for {n} slots "
+              f"(need ≥${args.min_notional / args.equity_fraction:.0f}/slot); "
+              f"will monitor existing positions, new opens skipped")
 
     # ------------------------------------------------------------------
     # Strategy pool + open-eligibility flags
@@ -291,6 +310,23 @@ def main() -> None:
             can_open[sym] = True
         print(f"  rotation: initial top-{args.top_n}: {', '.join(top) or '(none eligible)'}")
         log.info("carry_rotation_initial", top_n=top, funding=fmap)
+
+    # ------------------------------------------------------------------
+    # Reconcile existing positions from a previous run (or a symbol that
+    # dropped out of the top-N). They get a strategy so close/rebalance
+    # signals still fire, but can_open=False so no NEW positions open.
+    # ------------------------------------------------------------------
+    if not args.dry_run:
+        try:
+            for p in exchange.get_positions():
+                sym = p.get("symbol", "")
+                if sym and abs(_f(p.get("size", 0))) > 0 and sym not in pool:
+                    _ensure_strategy(pool, exchange, sym, args, per_slot_equity)
+                    can_open[sym] = False
+                    print(f"  [{sym}] existing position — monitoring (locked, no new opens)")
+                    log.info("carry_reconcile_existing", symbol=sym, can_open=False)
+        except Exception as exc:
+            log.warning("reconcile_existing_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # Banner

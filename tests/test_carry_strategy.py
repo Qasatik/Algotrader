@@ -596,3 +596,55 @@ def test_open_no_grossup_when_fee_zero():
     spot_qty = float(ex.place_spot_order.call_args.args[0]["qty"])
     # 0.076 × 65000 = 4940.0 (no gross-up)
     assert spot_qty == pytest.approx(0.076 * 65000.0, abs=0.5)
+
+
+def test_position_size_cleans_float_artifacts():
+    """Regression (LINKUSDT 'Qty invalid'): rounding to the lot step must not
+    leave IEEE-754 residue like ``1.2000000000000002``.
+
+    With ``qty_step=0.1``, ``12 * 0.1`` computes to
+    ``1.2000000000000002`` in raw float math, which Bybit rejects. The sizer
+    must round back to the step's own decimal precision.
+    """
+    ex = _mock_exchange(funding=0.0003, perp=4100.0, spot=4100.0, equity=10000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.1,
+        size_mult_min=1.0, size_mult_max=1.0,
+    ))
+    act = s.decide()
+    assert act.action == "open"
+    # notional 5000 / 4100 = 1.2195 → 12 steps × 0.1 = 1.2 (NOT 1.2000000000000002)
+    assert act.qty == 1.2
+    # the cleaned qty must be exactly representable at 1 decimal place
+    assert act.qty == round(act.qty, 1)
+
+
+def test_min_notional_skips_tiny_open():
+    """When free capital is low the sized notional can fall below the exchange
+    minimum (~$5). The strategy must NOT open — Bybit would reject the spot leg
+    with 'Insufficient balance' / min-order errors, churning open→rollback.
+    """
+    # Tiny equity: 10000 × 0.5% fraction = 50 notional → but cap forces tiny qty.
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=100.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001,
+        size_mult_min=1.0, size_mult_max=1.0,
+        min_notional=5.0,
+    ))
+    act = s.decide()
+    # notional = 100 × 0.5 = 50; qty = 50/65000 = 0.000769 → 0 steps → qty 0
+    # OR if qty>0 but notional < 5 → "none". Either way, NO open.
+    assert act.action == "none"
+
+
+def test_min_notional_allows_healthy_open():
+    """A normal-sized position (notional well above min) opens as usual."""
+    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=10000.0)
+    s = CarryStrategy(ex, CarryConfig(
+        equity_fraction=0.5, qty_step=0.001,
+        size_mult_min=1.0, size_mult_max=1.0,
+        min_notional=5.0,
+    ))
+    act = s.decide()
+    assert act.action == "open"
+    assert act.qty * 65000.0 >= 5.0

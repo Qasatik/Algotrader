@@ -20,6 +20,7 @@ mock exchange. ``execute()`` turns an action into real orders.
 from __future__ import annotations
 
 import csv
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -70,6 +71,9 @@ class CarryConfig:
     qty_step: float = 0.001  # BTC lot step (round qty down to this)
     paper_equity: float | None = None  # if set, override wallet balance (dry-run)
     max_notional: float | None = None  # hard cap on position notional (USDT safety)
+    # Skip opening when the sized notional is below this (USDT). Bybit rejects
+    # spot orders below ~$5 notional; tiny positions also can't cover fees.
+    min_notional: float = 5.0
     trade_log: str | None = None  # CSV path for persistent trade history (None=off)
     # Exchange-side backstop stop-loss (protects while bot is OFFLINE).
     # Set as a Bybit trading-stop order on the perp short after opening.
@@ -246,7 +250,15 @@ class CarryStrategy:
             notional = min(notional, self.cfg.max_notional)  # hard safety cap
         raw_qty = notional / price if price > 0 else 0.0
         step = self.cfg.qty_step
-        return max((raw_qty // step) * step, 0.0)
+        steps = math.floor(raw_qty / step)
+        qty = steps * step
+        # Clean up floating-point artifacts: (12 * 0.1) gives
+        # 1.2000000000000002 in IEEE-754, which Bybit rejects as "Qty invalid".
+        # Round to the step's own decimal precision.
+        if step < 1:
+            decimals = max(0, int(math.ceil(-math.log10(step))))
+            qty = round(qty, decimals)
+        return max(qty, 0.0)
 
     def _entry_confidence(self, funding: float, basis: float) -> float:
         """Heuristic P(profit) proxy in [0, 1] for a carry entry.
@@ -402,6 +414,15 @@ class CarryStrategy:
         qty = self._position_size(price, confidence)
         if qty <= 0:
             return CarryAction("none", "no equity / qty=0", funding_rate=funding, basis_bps=basis)
+        notional = qty * price
+        if notional < self.cfg.min_notional:
+            # Too small for the exchange (Bybit rejects spot orders < ~$5) and
+            # can't cover round-trip fees. Wait for more free capital.
+            return CarryAction(
+                "none",
+                f"notional {notional:.1f} < min {self.cfg.min_notional:.0f}",
+                funding_rate=funding, basis_bps=basis,
+            )
         self.state = CarryState.HEDGED
         self.position_qty = qty
         self.entry_basis_bps = basis
