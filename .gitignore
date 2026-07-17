@@ -1,3 +1,9 @@
+# ---- Private business documents (NOT for public GitHub) ------------
+BUSINESS_PLAN.md
+TECHNICAL_CHECKLIST.md
+SAAS_ROADMAP.md
+CARRY_ROADMAP.md
+
 # ---- Secrets / env -------------------------------------------------
 .env
 *.env
