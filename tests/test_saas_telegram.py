@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
+from core.security import ApiKeyAudit
 from saas.billing import BillingService, UsdtGateway
 from saas.database import Database
 from saas.models import Tier
@@ -35,10 +37,14 @@ class _MockMessage:
     text: str = ""
     replies: list[str] = field(default_factory=list)
     reply_markups: list = field(default_factory=list)
+    deleted: bool = False
 
     async def reply_text(self, text: str, parse_mode=None, reply_markup=None) -> None:
         self.replies.append(text)
         self.reply_markups.append(reply_markup)
+
+    async def delete(self) -> None:
+        self.deleted = True
 
 
 @dataclass
@@ -640,3 +646,181 @@ class TestMenuText:
         _run(bot._handle_menu_text(tu, tc))
         # No replies should be added (handler ignores unknown text).
         assert len(tu.message.replies) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# /connect — API key connection (audited, encrypted)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _ok_audit() -> ApiKeyAudit:
+    """A passing API-key audit (safe permissions, IP-whitelisted)."""
+    return ApiKeyAudit(
+        ok=True, note="test-key",
+        permissions={"ContractTrade": ["Order"]},
+        ip_whitelist=["1.2.3.4"], expires_at=None, read_only=False,
+    )
+
+
+def _bad_audit() -> ApiKeyAudit:
+    """A failing API-key audit (dangerous withdrawal permission)."""
+    return ApiKeyAudit(
+        ok=False, note="bad-key", permissions={},
+        ip_whitelist=[], expires_at=None, read_only=False,
+        warnings=["CRITICAL: key has 'Withdraw' permission"],
+    )
+
+
+class TestConnect:
+    def test_no_args_shows_usage(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_connect(u2, c2))
+        assert "Использование" in u2.message.replies[-1]
+
+    def test_successful_connect(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        with patch("saas.telegram_saas.audit_api_key", return_value=_ok_audit()):
+            u2, c2 = _make_update(111)
+            c2.args = ["fakekey", "fakesecret"]
+            _run(bot._cmd_connect(u2, c2))
+
+        text = u2.message.replies[-1]
+        assert "подключён" in text.lower()
+        user = bot.mgr.get_by_telegram_id(111)
+        assert user.has_api_key
+
+    def test_rejected_key_not_stored(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        with patch("saas.telegram_saas.audit_api_key", return_value=_bad_audit()):
+            u2, c2 = _make_update(111)
+            c2.args = ["badkey", "badsecret"]
+            _run(bot._cmd_connect(u2, c2))
+
+        text = u2.message.replies[-1]
+        assert "отклонён" in text.lower()
+        user = bot.mgr.get_by_telegram_id(111)
+        assert not user.has_api_key
+
+    def test_audit_failure_shows_error(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        with patch("saas.telegram_saas.audit_api_key", side_effect=RuntimeError("network")):
+            u2, c2 = _make_update(111)
+            c2.args = ["key", "secret"]
+            _run(bot._cmd_connect(u2, c2))
+
+        text = u2.message.replies[-1]
+        assert "Не удалось" in text
+        user = bot.mgr.get_by_telegram_id(111)
+        assert not user.has_api_key
+
+    def test_message_deleted_to_hide_secret(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        with patch("saas.telegram_saas.audit_api_key", return_value=_ok_audit()):
+            u2, c2 = _make_update(111)
+            c2.args = ["key", "secret"]
+            _run(bot._cmd_connect(u2, c2))
+
+        assert u2.message.deleted
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# /start_bot, /stop_bot — trading toggle
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestStartBot:
+    def test_no_api_key_rejected(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_start_bot(u2, c2))
+        assert "API-ключ" in u2.message.replies[-1]
+
+    def test_expired_subscription_rejected(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        bot.mgr.connect_api_key(user.id, "k", "s")
+        # Expire the 7-day trial so is_subscribed is False.
+        with bot.mgr.db.connect() as conn:
+            conn.execute(
+                "UPDATE users SET subscription_until = 0 WHERE id = ?",
+                (user.id,),
+            )
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_start_bot(u2, c2))
+        assert "подписка" in u2.message.replies[-1].lower()
+
+    def test_starts_with_key_and_subscription(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        bot.mgr.connect_api_key(user.id, "k", "s")
+        inv = bot.billing.create_invoice(user.id, Tier.PRO)
+        bot.billing.confirm_payment(inv.id, "tx1")
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_start_bot(u2, c2))
+        assert "запущен" in u2.message.replies[-1].lower()
+        user = bot.mgr.get_by_telegram_id(111)
+        assert user.bot_enabled
+
+
+class TestStopBot:
+    def test_stops_bot(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        bot.mgr.set_bot_enabled(user.id, True)
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_stop_bot(u2, c2))
+        assert "остановлен" in u2.message.replies[-1].lower()
+        user = bot.mgr.get_by_telegram_id(111)
+        assert not user.bot_enabled
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# /status — bot state overview
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestStatus:
+    def test_shows_tier_and_subscription(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_status(u2, c2))
+        text = u2.message.replies[-1]
+        assert "Статус" in text
+        assert "FREE" in text
+        assert "не подключён" in text  # no API key
+
+    def test_shows_running_bot(self, bot):
+        u, c = _make_update(111)
+        _run(bot._cmd_start(u, _MockContext()))
+        user = bot.mgr.get_by_telegram_id(111)
+        bot.mgr.connect_api_key(user.id, "k", "s")
+        inv = bot.billing.create_invoice(user.id, Tier.PRO)
+        bot.billing.confirm_payment(inv.id, "tx1")
+        bot.mgr.set_bot_enabled(user.id, True)
+
+        u2, c2 = _make_update(111)
+        _run(bot._cmd_status(u2, c2))
+        text = u2.message.replies[-1]
+        assert "работает" in text
+        assert "подключён" in text

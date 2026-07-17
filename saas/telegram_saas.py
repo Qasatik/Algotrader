@@ -21,6 +21,10 @@ Commands
     /invoices          - list your recent invoices
     /myplan            - current tier, days left, limits
     /referral          - your referral code & earnings
+    /connect K S       - connect a Bybit API key (audited, encrypted, deleted)
+    /start_bot         - enable trading (requires key + active subscription)
+    /stop_bot          - pause trading (positions stay protected)
+    /status            - bot state, tier, subscription, last cycle
     /admin_pay <id>    - [ADMIN] confirm a payment manually
 """
 from __future__ import annotations
@@ -48,8 +52,11 @@ from telegram.ext import (
     filters,
 )
 
+from core.exchange import BybitExchange
+from core.security import audit_api_key
 from saas.billing import BillingService
 from saas.models import Tier, TierLimits
+from saas.tenant_runner import TenantRunner
 from saas.user_manager import UserManager
 from utils.logger import get_logger
 
@@ -71,11 +78,13 @@ class SaaSTelegramBot:
         mgr: UserManager,
         billing: BillingService,
         admin_ids: list[int] | None = None,
+        runner: TenantRunner | None = None,
     ) -> None:
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is not set for the SaaS bot.")
         self.mgr = mgr
         self.billing = billing
+        self.runner = runner
         self.admin_ids = admin_ids if admin_ids is not None else _DEFAULT_ADMINS
 
         self.app: Application = (
@@ -98,6 +107,11 @@ class SaaSTelegramBot:
         add(CommandHandler("referral", self._cmd_referral))
         add(CommandHandler("admin_pay", self._cmd_admin_pay))
         add(CommandHandler("help", self._cmd_help))
+        # Trading commands (migrated from bot/telegram_saas.py)
+        add(CommandHandler("connect", self._cmd_connect))
+        add(CommandHandler("start_bot", self._cmd_start_bot))
+        add(CommandHandler("stop_bot", self._cmd_stop_bot))
+        add(CommandHandler("status", self._cmd_status))
         # Inline button callbacks (subscribe:basic, pay, etc.)
         add(CallbackQueryHandler(self._handle_callback))
         # Reply-keyboard menu buttons (text matching)
@@ -113,9 +127,10 @@ class SaaSTelegramBot:
         """Persistent main-menu keyboard (always visible below input)."""
         return ReplyKeyboardMarkup(
             [
-                [KeyboardButton("💰 Тарифы"), KeyboardButton("📋 Мой тариф")],
-                [KeyboardButton("🧾 Мои счета"), KeyboardButton("🎁 Рефералка")],
-                [KeyboardButton("💳 Оплатить"), KeyboardButton("❓ Помощь")],
+                [KeyboardButton("💰 Тарифы"), KeyboardButton("📋 Мой тариф"), KeyboardButton("💳 Оплатить")],
+                [KeyboardButton("🔑 API-ключ"), KeyboardButton("▶️ Старт бота"), KeyboardButton("⏹ Стоп бота")],
+                [KeyboardButton("📊 Статус"), KeyboardButton("🧾 Счета"), KeyboardButton("🎁 Рефералка")],
+                [KeyboardButton("❓ Помощь")],
             ],
             resize_keyboard=True,
             one_time_keyboard=False,
@@ -139,11 +154,22 @@ class SaaSTelegramBot:
         )
 
     async def start(self) -> None:
-        """Start polling (blocks)."""
+        """Start polling + optional TenantRunner supervisor (blocks)."""
+        runner_task = None
+        if self.runner is not None:
+            runner_task = asyncio.create_task(self.runner.run())
+            log.info("saas_telegram.tenant_runner_started")
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling()  # type: ignore[union-attr]
         log.info("saas_telegram.started")
+        try:
+            await asyncio.Event().wait()  # keep alive until interrupted
+        finally:
+            if runner_task is not None and self.runner is not None:
+                self.runner.stop()
+                runner_task.cancel()
+            await self.stop()
 
     async def stop(self) -> None:
         """Graceful shutdown."""
@@ -217,9 +243,13 @@ class SaaSTelegramBot:
         routing = {
             "💰 Тарифы": self._cmd_pricing,
             "📋 Мой тариф": self._cmd_myplan,
-            "🧾 Мои счета": self._cmd_invoices,
-            "🎁 Рефералка": self._cmd_referral,
             "💳 Оплатить": self._cmd_pay,
+            "🔑 API-ключ": self._cmd_connect,
+            "▶️ Старт бота": self._cmd_start_bot,
+            "⏹ Стоп бота": self._cmd_stop_bot,
+            "📊 Статус": self._cmd_status,
+            "🧾 Счета": self._cmd_invoices,
+            "🎁 Рефералка": self._cmd_referral,
             "❓ Помощь": self._cmd_help,
         }
         handler = routing.get(text)
@@ -477,13 +507,131 @@ class SaaSTelegramBot:
             f"Сумма: {self._fmt_price(invoice.amount_usdt)} USDT",
         )
 
+    # ------------------------------------------------------------------
+    # Trading commands (migrated from bot/telegram_saas.py)
+    # ------------------------------------------------------------------
+    @staticmethod
+    async def _delete_message(update: Update) -> None:
+        """Best-effort delete the user's message (hide API secrets from history)."""
+        try:
+            await update.message.delete()
+        except Exception:  # noqa: BLE001 — deletion is best-effort
+            pass
+
+    async def _cmd_connect(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Connect a Bybit API key: audit → encrypt → store. Deletes the message."""
+        user = self._get_or_register(update)
+        if user is None:
+            return
+        if len(ctx.args) < 2:
+            await update.message.reply_text(
+                "Использование: <code>/connect API_KEY API_SECRET</code>\n\n"
+                "⚠️ Создайте ключ с правами <b>только</b> Spot+Derivatives Trade, "
+                "БЕЗ вывода средств.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        api_key, api_secret = ctx.args[0], ctx.args[1]
+        await self._delete_message(update)  # hide secrets from chat history
+
+        await update.message.reply_text("🔍 Проверяю права ключа…")
+        try:
+            ex = BybitExchange(testnet=False, api_key=api_key, api_secret=api_secret)
+            audit = await asyncio.to_thread(audit_api_key, ex)
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"❌ Не удалось проверить ключ: {exc}")
+            return
+
+        if not audit.ok:
+            reasons = "; ".join(audit.warnings) or "небезопасные права"
+            await update.message.reply_text(
+                f"❌ <b>Ключ отклонён</b>: {reasons}\n\n"
+                "Создайте новый ключ БЕЗ прав Withdraw/Wallet.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        self.mgr.connect_api_key(user.id, api_key, api_secret)
+        extra = ""
+        if not audit.has_ip_whitelist:
+            extra = (
+                "\n\n⚠️ У ключа нет IP-whitelist — добавьте IP сервера в "
+                "настройках Bybit для дополнительной защиты."
+            )
+        await update.message.reply_text(
+            "✅ <b>Ключ подключён и зашифрован!</b>\n"
+            "Запустите бота: /start_bot" + extra,
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_start_bot(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Enable trading for the user."""
+        user = self._get_or_register(update)
+        if user is None:
+            return
+        if not user.has_api_key:
+            await update.message.reply_text("❌ Сначала подключите API-ключ: /connect")
+            return
+        if not user.is_subscribed:
+            await update.message.reply_text(
+                "❌ Подписка истекла. Обновите тариф: /pricing",
+            )
+            return
+        self.mgr.set_bot_enabled(user.id, True)
+        await update.message.reply_text(
+            "▶️ <b>Бот запущен!</b> Позиции будут открываться автоматически.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_stop_bot(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Disable trading (positions stay protected)."""
+        user = self._get_or_register(update)
+        if user is None:
+            return
+        self.mgr.set_bot_enabled(user.id, False)
+        await update.message.reply_text(
+            "⏸ <b>Бот остановлен.</b> Открытые позиции остаются под защитой "
+            "(basis-guard, exchange-side SL).",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show bot state, tier, subscription, and last trading cycle."""
+        user = self._get_or_register(update)
+        if user is None:
+            return
+        sub = f"✅ активна ({user.days_left():.0f} дн.)" if user.is_subscribed else "❌ истекла"
+        key = "✅ подключён" if user.has_api_key else "❌ не подключён"
+        bot = "▶️ работает" if user.bot_enabled else "⏸ остановлен"
+        last = ""
+        if self.runner is not None:
+            tenants = {t["user_id"]: t for t in self.runner.tenant_status()}
+            t = tenants.get(user.id)
+            if t and t.get("last_status"):
+                last = f"\nПоследний цикл: <code>{t['last_status']}</code>"
+        await update.message.reply_text(
+            f"📊 <b>Статус</b>\n\n"
+            f"Тариф: <b>{user.effective_tier.value.upper()}</b>\n"
+            f"Подписка: {sub}\n"
+            f"API-ключ: {key}\n"
+            f"Бот: {bot}{last}",
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """List all available commands."""
         self._get_or_register(update)  # lazy-register if needed
         is_admin = self._is_admin(update)
         lines = [
             "<b>📖 Команды AlgoTrader</b>\n",
-            "/start — регистрация / приветствие",
+            "<b>💼 Торговля:</b>",
+            "/connect <i>KEY SECRET</i> — подключить API-ключ Bybit",
+            "/start_bot — запустить торговлю",
+            "/stop_bot — остановить торговлю",
+            "/status — статус бота и позиции",
+            "",
+            "<b>💳 Подписка:</b>",
             "/pricing — тарифы и цены",
             "/subscribe <i>basic|pro|vip</i> — создать счёт",
             "/pay — инструкция по оплате",
@@ -492,7 +640,7 @@ class SaaSTelegramBot:
             "/referral — реферальная программа",
         ]
         if is_admin:
-            lines.append("\n<b>Админ:</b>")
+            lines.append("\n<b>🔑 Админ:</b>")
             lines.append("/admin_pay <i>id</i> — подтвердить оплату")
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.HTML,
@@ -549,6 +697,7 @@ def main() -> None:
     """Run the SaaS Telegram bot standalone (for development / testing)."""
     import os
 
+    from saas.billing import ManualGateway, UsdtGateway
     from saas.database import Database
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -563,19 +712,19 @@ def main() -> None:
     db.init()
     mgr = UserManager(db, master_secret)
 
-    from saas.billing import ManualGateway, UsdtGateway
-
     gateway = UsdtGateway(usdt_wallet) if usdt_wallet else ManualGateway()
     billing = BillingService(db, mgr, gateway)
+    runner = TenantRunner(mgr)
 
-    bot = SaaSTelegramBot(token, mgr, billing, admin_ids=admin_ids)
+    bot = SaaSTelegramBot(
+        token, mgr, billing, admin_ids=admin_ids, runner=runner,
+    )
+    log.info("saas_telegram.starting", usdt_wallet=bool(usdt_wallet))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(bot.start())
-        log.info("saas_telegram.polling — press Ctrl+C to stop")
-        loop.run_forever()
     finally:
         loop.run_until_complete(bot.stop())
         loop.close()
