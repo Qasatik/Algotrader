@@ -36,6 +36,7 @@ import signal
 import time
 
 from config.loader import config_defaults_from_argv
+from core.btc_accumulator import BtcAccumulator
 from core.carry_strategy import DEFAULT_TRADE_LOG, CarryAction, CarryConfig, CarryStrategy
 from core.exchange import BybitExchange
 from core.pnl_tracker import append_history as _pnl_append
@@ -131,6 +132,12 @@ def _build_argparser() -> argparse.ArgumentParser:
                          "CLI flags still win)")
     ap.add_argument("--skip-api-audit", action="store_true",
                     help="skip the startup API-key security audit (P3-13)")
+    ap.add_argument("--btc-accum", action="store_true",
+                    help="auto-convert funding profits to BTC spot (DCA into Bitcoin)")
+    ap.add_argument("--btc-accum-threshold", type=float, default=5.0,
+                    help="min unconverted profit (USDT) before buying BTC (default $5)")
+    ap.add_argument("--btc-accum-reserve", type=float, default=10.0,
+                    help="always keep this much free USDT for trading (default $10)")
     return ap
 
 
@@ -294,6 +301,24 @@ def main() -> None:
               f"will monitor existing positions, new opens skipped")
 
     # ------------------------------------------------------------------
+    # BTC accumulator — auto-convert funding profits to BTC spot
+    # ------------------------------------------------------------------
+    accumulator: BtcAccumulator | None = None
+    if args.btc_accum and args.mainnet and not args.dry_run:
+        accumulator = BtcAccumulator(
+            exchange,
+            threshold_usdt=args.btc_accum_threshold,
+            min_free_reserve=args.btc_accum_reserve,
+        )
+        accumulator.init_baseline()
+        st = accumulator.status()
+        print(f"  ₿ BTC accumulator: ON | threshold ${args.btc_accum_threshold} | "
+              f"reserve ${args.btc_accum_reserve} | baseline PnL ${st['baseline_rpnl']}")
+        if not args.no_notify:
+            _notify(f"₿ BTC accumulator ON | threshold ${args.btc_accum_threshold} | "
+                    f"reserve ${args.btc_accum_reserve}")
+
+    # ------------------------------------------------------------------
     # Strategy pool + open-eligibility flags
     # ------------------------------------------------------------------
     pool: dict[str, CarryStrategy] = {}
@@ -408,6 +433,19 @@ def main() -> None:
                     _pnl_append(args.pnl_log, snap)
             except Exception as exc:
                 log.warning("pnl_snapshot_failed", error=str(exc))
+
+        # BTC accumulator — sweep funding profits into BTC spot.
+        # Checked every heartbeat cycle (not every poll) to reduce API calls.
+        if accumulator is not None and _on_hb:
+            try:
+                result = accumulator.check_and_convert()
+                if result and not args.no_notify:
+                    _notify(
+                        f"₿ BTC bought: {result.qty:.8f} BTC for ${result.usdt_spent:.2f} "
+                        f"| total accumulated: {result.total_btc:.8f} BTC"
+                    )
+            except Exception as exc:
+                log.warning("btc_accumulator_check_failed", error=str(exc))
 
         # Sleep so SIGINT stays responsive. When the exchange is unreachable
         # (consecutive errors), back off exponentially instead of hammering it
