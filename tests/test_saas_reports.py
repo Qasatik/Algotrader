@@ -271,7 +271,7 @@ class TestExpiryWarningsToSend:
 class TestExpiredNoticesToSend:
     def test_returns_pairs(self, svc, billing):
         u = _make_user(svc, 101, "alice")
-        _pay_for(svc, billing, u, Tier.VIP)
+        _pay_for(svc, billing, u, Tier.PRO)
         with svc.db.connect() as conn:
             conn.execute(
                 "UPDATE users SET subscription_until = ? WHERE id = ?",

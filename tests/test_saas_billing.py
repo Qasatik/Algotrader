@@ -75,7 +75,7 @@ class TestCreateInvoice:
     def test_usdt_gateway_sets_method(self, billing_usdt):
         billing, mgr = billing_usdt
         u = _make_user(mgr)
-        inv = billing.create_invoice(u.id, Tier.VIP)
+        inv = billing.create_invoice(u.id, Tier.PRO)
         assert inv.payment_method == "usdt"
 
 
@@ -269,7 +269,7 @@ class TestPricingTable:
     def test_pricing_table_has_all_paid_tiers(self):
         table = BillingService.pricing_table()
         tiers = [row["tier"] for row in table]
-        assert tiers == ["basic", "pro", "vip"]
+        assert tiers == ["basic", "pro"]
         for row in table:
             assert row["price_usdt"] > 0
             assert row["duration_days"] == PLAN_DURATION_DAYS

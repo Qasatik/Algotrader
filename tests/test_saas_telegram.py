@@ -195,10 +195,8 @@ class TestPricing:
         text = update.message.replies[0]
         assert "BASIC" in text
         assert "PRO" in text
-        assert "VIP" in text
         assert "3" in text   # $3 basic
         assert "8" in text   # $8 pro
-        assert "15" in text  # $15 vip
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -253,7 +251,7 @@ class TestSubscribe:
 
     def test_invoice_has_usdt_instructions(self, bot):
         update, ctx = _make_update(111)
-        ctx.args = ["vip"]
+        ctx.args = ["pro"]
         _run(bot._cmd_subscribe(update, ctx))
         text = update.message.replies[0]
         assert "TRC-20" in text
@@ -531,12 +529,10 @@ class TestKeyboards:
         texts = [b.text for b in buttons]
         assert any("BASIC" in t for t in texts)
         assert any("PRO" in t for t in texts)
-        assert any("VIP" in t for t in texts)
         # Check callback_data
         datas = [b.callback_data for b in buttons]
         assert "subscribe:basic" in datas
         assert "subscribe:pro" in datas
-        assert "subscribe:vip" in datas
 
     def test_start_includes_main_keyboard(self, bot):
         update, ctx = _make_update(111)

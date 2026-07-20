@@ -30,9 +30,8 @@ from saas.user_manager import UserManager
 #: APR ($3.33/mo) can still justify a $3 BASIC subscription.
 #: Bybit affiliate (30% of trading fees) is a secondary passive revenue stream.
 PLAN_PRICES: dict[Tier, float] = {
-    Tier.BASIC: 3.0,   # ~250 ₽/mo  — 3 symbols, $500 notional
-    Tier.PRO: 8.0,     # ~700 ₽/mo  — 10 symbols, $5000, rebalancing
-    Tier.VIP: 15.0,    # ~1300 ₽/mo — unlimited, priority support
+    Tier.BASIC: 3.0,   # ~290 ₽/mo  — 3 symbols, BTC accumulation
+    Tier.PRO: 8.0,     # ~690 ₽/mo  — 8 symbols, any accumulation
 }
 
 #: How many days a subscription purchase grants.
@@ -350,7 +349,7 @@ class BillingService:
         from saas.models import TierLimits
 
         result = []
-        for tier in [Tier.BASIC, Tier.PRO, Tier.VIP]:
+        for tier in [Tier.BASIC, Tier.PRO]:
             limits = TierLimits.for_tier(tier)
             result.append({
                 "tier": tier.value,

@@ -16,7 +16,7 @@ Commands
 --------
     /start [ref_code]  - register (optional referral deep-link) / greeting
     /pricing           - show subscription plans & prices
-    /subscribe <tier>  - create an invoice (basic / pro / vip)
+    /subscribe <tier>  - create an invoice (basic / pro)
     /pay               - payment instructions for your pending invoice
     /invoices          - list your recent invoices
     /myplan            - current tier, days left, limits
@@ -146,9 +146,6 @@ class SaaSTelegramBot:
                 )],
                 [InlineKeyboardButton(
                     "PRO — $8/мес", callback_data="subscribe:pro",
-                )],
-                [InlineKeyboardButton(
-                    "VIP — $15/мес", callback_data="subscribe:vip",
                 )],
             ]
         )
@@ -329,7 +326,7 @@ class SaaSTelegramBot:
         if not ctx.args:
             await update.message.reply_text(
                 "Укажите тариф: <code>/subscribe basic</code> "
-                "(или pro / vip)",
+                "(или pro)",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -339,14 +336,14 @@ class SaaSTelegramBot:
             tier = Tier(raw)
         except ValueError:
             await update.message.reply_text(
-                f"Неизвестный тариф «{raw}». Доступно: basic, pro, vip.",
+                f"Неизвестный тариф «{raw}». Доступно: basic, pro.",
             )
             return
 
         if tier == Tier.FREE:
             await update.message.reply_text(
                 "FREE — бесплатный тариф, оплата не требуется. "
-                "Используйте /subscribe basic (или pro / vip).",
+                "Используйте /subscribe basic (или pro).",
             )
             return
 
@@ -633,7 +630,7 @@ class SaaSTelegramBot:
             "",
             "<b>💳 Подписка:</b>",
             "/pricing — тарифы и цены",
-            "/subscribe <i>basic|pro|vip</i> — создать счёт",
+            "/subscribe <i>basic|pro</i> — создать счёт",
             "/pay — инструкция по оплате",
             "/invoices — мои счета",
             "/myplan — мой тариф и лимиты",

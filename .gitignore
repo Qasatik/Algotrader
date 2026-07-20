@@ -36,6 +36,7 @@ data/*.parquet
 data/*.json
 data/*.csv
 data/*.log
+data/*.db
 wandb/
 
 # ---- IDE / OS ------------------------------------------------------

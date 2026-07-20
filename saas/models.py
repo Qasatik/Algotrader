@@ -15,9 +15,8 @@ class Tier(str, Enum):
     """Subscription tiers, ordered by capability."""
 
     FREE = "free"    # trial / expired — 1 symbol, tiny notional
-    BASIC = "basic"  # 3 symbols, $500 notional
-    PRO = "pro"      # 10 symbols, $5000 notional
-    VIP = "vip"      # unlimited
+    BASIC = "basic"  # 3 symbols, BTC accumulation only
+    PRO = "pro"      # 8 symbols, any accumulation target
 
 
 @dataclass(frozen=True)
@@ -39,10 +38,8 @@ _TIER_LIMITS: dict[Tier, TierLimits] = {
     Tier.FREE: TierLimits(max_symbols=1, max_notional=100.0,
                           can_rebalance=False, advanced_alerts=False),
     Tier.BASIC: TierLimits(max_symbols=3, max_notional=500.0,
-                           can_rebalance=False, advanced_alerts=True),
-    Tier.PRO: TierLimits(max_symbols=10, max_notional=5000.0,
-                         can_rebalance=True, advanced_alerts=True),
-    Tier.VIP: TierLimits(max_symbols=999, max_notional=999_999.0,
+                           can_rebalance=True, advanced_alerts=True),
+    Tier.PRO: TierLimits(max_symbols=8, max_notional=5000.0,
                          can_rebalance=True, advanced_alerts=True),
 }
 
