@@ -32,8 +32,14 @@ jobs:
         with:
           languages: ${{ matrix.language }}
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+      # Install lightweight deps so CodeQL can resolve imports.
+      # Skip torch/pybit (heavy, not needed for static analysis).
+      - name: Install dependencies for analysis
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas pydantic pydantic-settings python-dotenv \
+                      prometheus-client structlog tenacity \
+                      python-telegram-bot cryptography aiohttp
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3

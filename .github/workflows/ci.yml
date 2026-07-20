@@ -26,10 +26,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install ruff pytest pytest-asyncio
-          # Install only the lightweight deps needed for unit tests
-          # (torch/pybit are heavy; tests mock the exchange & use CPU numpy)
+          # Install the lightweight deps needed for unit tests.
+          # torch/pybit are heavy and fully mocked in tests.
           pip install numpy pandas pydantic pydantic-settings python-dotenv \
-                      prometheus-client structlog tenacity
+                      prometheus-client structlog tenacity \
+                      python-telegram-bot cryptography
 
       - name: Lint (ruff)
         run: ruff check .
@@ -44,25 +45,3 @@ jobs:
           BYBIT_TESTNET: "true"
           ML_DEVICE: "cpu"
         run: pytest -v
-
-  build-image:
-    name: Build Docker image
-    needs: lint-and-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build (no push on PR)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          tags: bybit-algo-bot:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

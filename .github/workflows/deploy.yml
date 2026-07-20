@@ -1,16 +1,11 @@
 name: Deploy
 
 # Builds the GPU image, pushes to GHCR, then SSH-deploys to the
-# Singapore trading server. Triggered manually or on main pushes.
+# production trading server. Triggered MANUALLY only — configure the
+# DEPLOY_HOST / DEPLOY_USER / DEPLOY_SSH_KEY / DEPLOY_PATH secrets
+# before using.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "**/*.py"
-      - "requirements.txt"
-      - "Dockerfile"
-      - "docker-compose.yml"
 
 jobs:
   deploy:
@@ -45,7 +40,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Deploy to Singapore GPU host via SSH
+      - name: Deploy to production host via SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
