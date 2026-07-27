@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Bybit Carry Bot
+GenericName=Algo trading bot
+Comment=Start the Bybit carry trading bot (user systemd service) at login
+Comment[ru]=Запуск Bybit carry-бота (user-сервис systemd) при входе в систему
+Exec=/usr/bin/systemctl --user start carry-bot
+Icon=utilities-terminal
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+Categories=Finance;

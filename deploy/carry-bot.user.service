@@ -1,0 +1,59 @@
+# Bybit delta-neutral funding carry bot — USER systemd service unit (LIVE mainnet)
+#
+# No-root alternative to carry-bot.service for personal/desktop machines.
+# Runs under your own user, survives crashes (Restart=always) and starts at
+# login. For a true "starts at boot, before anyone logs in" you additionally
+# need lingering enabled once (see deploy/README.md → Автозапуск без root).
+#
+# Install (no sudo needed):
+#   bash deploy/install-autostart.sh
+# or manually:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/carry-bot.user.service ~/.config/systemd/user/carry-bot.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now carry-bot
+#
+# View live logs (journald):
+#   journalctl --user -u carry-bot -f
+#
+# Manage:
+#   systemctl --user status  carry-bot
+#   systemctl --user restart carry-bot
+#   systemctl --user stop    carry-bot      # leaves the carry position OPEN
+#   systemctl --user disable --now carry-bot
+#
+# NOTE: this runs REAL-MONEY trading. Edit ExecStart params below to match
+# your risk settings (min-funding, max-notional, leverage, equity-fraction).
+# The position is LEFT OPEN on stop (no --flatten-on-exit) so it keeps
+# collecting funding across restarts.
+
+[Unit]
+Description=Bybit delta-neutral funding carry bot (LIVE mainnet, user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bybit-algo-bot
+Environment=PYTHONPATH=.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/usr/bin/python3 scripts/run_carry_testnet.py \
+    --mainnet --yes \
+    --interval 10 \
+    --min-funding 0.00005 \
+    --max-notional 70 \
+    --leverage 2 \
+    --equity-fraction 0.7
+
+# Resilience: restart on any crash / reboot, after a short back-off.
+Restart=always
+RestartSec=10
+
+# Send SIGINT (not the default SIGTERM) so the runner's graceful-shutdown
+# handler runs. The poll loop checks the flag every ~1s, so 20s is plenty.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

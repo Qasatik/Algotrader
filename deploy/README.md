@@ -32,6 +32,45 @@ sudo systemctl enable --now carry-bot
 > `leverage`, `equity-fraction`) — они должны совпадать с вашими настройками
 > риска.
 
+## Автозапуск без root (user-service + autostart)
+
+Для личного/десктоп-компьютера, где нет беспарольного `sudo`, бот
+поднимается **без прав root** через пользовательский systemd-сервис.
+Он переживает падения (`Restart=always`) и стартует при входе в систему.
+XDG-запись в `~/.config/autostart/` запускает тот же сервис при старте
+графической сессии — оба триггера сходятся на один сервис
+(`systemctl --user start` идемпотентен), поэтому **двойного процесса не будет**.
+
+Установка в одну команду (без sudo):
+
+```bash
+cd ~/bybit-algo-bot
+bash deploy/install-autostart.sh
+```
+
+Скрипт копирует [`carry-bot.user.service`](carry-bot.user.service) в
+`~/.config/systemd/user/carry-bot.service`, [`carry-bot.desktop`](carry-bot.desktop)
+в `~/.config/autostart/`, перезагружает юниты и включает сервис
+(`enable --now`). Удалить: `bash deploy/install-autostart.sh --remove`.
+
+> Хотите, чтобы бот стартовал **до входа в систему** (сразу при загрузке)?
+> Один раз разрешите lingering (нужен root):
+> ```bash
+> sudo loginctl enable-linger $USER
+> ```
+> Без linger бот запускается при входе в десктоп — для персонального ПК
+> это и есть «вместе с компьютером».
+
+Управление (user-режим):
+
+| Действие | Команда |
+|---|---|
+| Статус | `systemctl --user status carry-bot` |
+| Логи | `journalctl --user -u carry-bot -f` |
+| Перезапуск | `systemctl --user restart carry-bot` |
+| Остановить (позиция остаётся) | `systemctl --user stop carry-bot` |
+| Отключить | `systemctl --user disable --now carry-bot` |
+
 ## Управление
 
 | Действие | Команда |
