@@ -28,7 +28,7 @@
 # collecting funding across restarts.
 
 [Unit]
-Description=Bybit delta-neutral funding carry bot (LIVE mainnet, user service)
+Description=Bybit carry bot — MULTI top-5 by funding rate (LIVE mainnet, user service)
 After=network-online.target
 Wants=network-online.target
 
@@ -38,8 +38,12 @@ WorkingDirectory=%h/bybit-algo-bot
 Environment=PYTHONPATH=.
 Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/usr/bin/python3 scripts/run_carry_testnet.py \
+# Multi-symbol mode: scan the 14-coin universe, rank by funding rate, keep the
+# TOP-5 open. Capital is split into 5 equal slots (equity/5 each). max-notional
+# is a PER-SLOT cap. Same conservative risk params as before.
+ExecStart=/usr/bin/python3 scripts/run_carry_multi.py \
     --mainnet --yes \
+    --top-n 5 \
     --interval 10 \
     --min-funding 0.00005 \
     --max-notional 70 \
