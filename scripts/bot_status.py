@@ -203,21 +203,22 @@ def query_balance(mainnet: bool, symbol: str) -> dict:
             if float(c.get("usd_value", 0) or 0) > 0.0001
             or float(c.get("wallet_balance", 0) or 0) > 0.0001
         ]
-        # open perp position size for the trading symbol
+        # ALL open perp positions — the multi-symbol runner trades 5+ symbols,
+        # so reporting only --symbol (default BTCUSDT) misleadingly showed
+        # "FLAT" while XRP/BNB/SUI/DOGE hedges were open (2026-08-22 incident).
         try:
-            positions = ex.get_positions(symbol)
-            perp = next((p for p in positions if p.get("symbol") == symbol), None)
-            size = abs(float(perp.get("size", 0))) if perp else 0.0
-            side = perp.get("side", "") if perp else ""
-            upnl = float(perp.get("unrealisedPnl", 0)) if perp else 0.0
-            info["position"] = {
-                "symbol": symbol,
-                "side": side,
-                "size_btc": round(size, 6),
-                "upnl_usdt": round(upnl, 4),
-            }
+            info["positions"] = [
+                {
+                    "symbol": p.get("symbol", "?"),
+                    "side": p.get("side", ""),
+                    "size": abs(float(p.get("size", 0) or 0)),
+                    "upnl_usdt": round(float(p.get("unrealisedPnl", 0) or 0), 4),
+                }
+                for p in ex.get_positions()
+                if abs(float(p.get("size", 0) or 0)) > 0
+            ]
         except Exception as exc:
-            info["position"] = {"error": str(exc)}
+            info["positions"] = [{"error": str(exc)}]
         info["ok"] = True
     except Exception as exc:
         info["error"] = str(exc)
@@ -319,12 +320,15 @@ def main() -> int:
         print(f"\n  💰 BALANCE:  total equity \033[1m{eq:,.4f} USDT\033[0m")
         for c in bal.get("coins", []):
             print(f"             • {c['coin']:<6} wallet={c['wallet']:<14} ≈ {c['usd']:,.4f} USD")
-        pos = bal.get("position", {})
-        if isinstance(pos, dict) and "size_btc" in pos and pos["size_btc"] > 0:
-            pnl = pos.get("upnl_usdt", 0.0)
-            pcol = "\033[32m" if pnl >= 0 else "\033[31m"
-            print(f"             • position {pos.get('symbol')} {pos.get('side')} "
-                  f"{pos['size_btc']} BTC  uPnL {pcol}{pnl:+.4f} USDT\033[0m")
+        positions = bal.get("positions", [])
+        if positions and not positions[0].get("error"):
+            for pos in positions:
+                pnl = pos.get("upnl_usdt", 0.0)
+                pcol = "\033[32m" if pnl >= 0 else "\033[31m"
+                print(f"             • position {pos['symbol']} {pos['side']} "
+                      f"{pos['size']}  uPnL {pcol}{pnl:+.4f} USDT\033[0m")
+        elif positions and positions[0].get("error"):
+            print(f"             • position query failed: {positions[0]['error']}")
         else:
             print("             • no open position (FLAT)")
     else:
