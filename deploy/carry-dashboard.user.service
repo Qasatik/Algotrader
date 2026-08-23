@@ -1,0 +1,28 @@
+# Carry bot read-only web dashboard — USER systemd service unit.
+# Shows positions, balance, funding scanner, charts (Chart.js, local static/).
+# READ-ONLY: never places orders.
+#
+# Install:
+#   cp deploy/carry-dashboard.user.service ~/.config/systemd/user/carry-dashboard.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now carry-dashboard
+#
+# View:  http://127.0.0.1:8500
+# Logs:  journalctl --user -u carry-dashboard -f
+
+[Unit]
+Description=Carry bot dashboard — read-only web UI (localhost:8500)
+After=network-online.target carry-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bybit-algo-bot
+Environment=PYTHONPATH=.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 scripts/web_dashboard.py --host 127.0.0.1 --port 8500 --refresh 5
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
