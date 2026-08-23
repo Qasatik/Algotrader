@@ -14,8 +14,9 @@ from saas.user_manager import UserManager
 def _mock_exchange():
     """A MagicMock exchange returning favorable carry conditions."""
     ex = MagicMock()
+    # 0.0005 (5bps/8h) clears the Phase0 EV gate (5 − 0 − 3.1 > 0).
     ex.get_funding_rate.return_value = {
-        "fundingRate": "0.0003", "markPrice": "65000", "lastPrice": "65000",
+        "fundingRate": "0.0005", "markPrice": "65000", "lastPrice": "65000",
     }
     ex.get_spot_price.return_value = 65000.0
     ex.get_wallet_balance.return_value = {
@@ -24,6 +25,12 @@ def _mock_exchange():
     ex.get_positions.return_value = []
     ex.place_order.return_value = {"orderId": "p1"}
     ex.place_spot_order.return_value = {"orderId": "s1"}
+    # Phase0 maker path: no touch/order data → market fallback (fast tests).
+    ex.get_touch.return_value = {}
+    ex.get_order_status.return_value = {}
+    ex.get_instrument_info.return_value = {
+        "lotSizeFilter": {"basePrecision": "0.00001", "minOrderQty": "0.00001"},
+    }
     return ex
 
 

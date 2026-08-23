@@ -32,6 +32,7 @@ receives ``total_equity / slots`` as its fixed sizing base.  The
 from __future__ import annotations
 
 import argparse
+import math
 import signal
 import time
 
@@ -124,9 +125,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--open-fail-cooldown", type=float, default=600.0,
                     help="seconds to wait before retrying after a failed open "
                          "(default 600; prevents open/rollback churn loops)")
-    ap.add_argument("--pnl-log", default=None,
+    ap.add_argument("--pnl-log", default="data/carry_pnl.csv",
                     help="append a net-worth snapshot (USDT+BTC) to this CSV "
-                         "every --heartbeat polls (P&L tracking)")
+                         "every --heartbeat polls (P&L tracking). Default ON — "
+                         "the dashboard equity chart is dead without it "
+                         "(2026-08-22: ran for a month with default=None and "
+                         "the chart showed stale July data).")
     ap.add_argument("--config", default=None,
                     help="path to TOML config file (overrides built-in defaults; "
                          "CLI flags still win)")
@@ -138,6 +142,30 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="min unconverted profit (USDT) before buying BTC (default $5)")
     ap.add_argument("--btc-accum-reserve", type=float, default=10.0,
                     help="always keep this much free USDT for trading (default $10)")
+    # --- Phase0: profitability upgrades ---
+    ap.add_argument("--universe-auto", action="store_true",
+                    help="auto-discover the scan universe: every USDT pair "
+                         "with BOTH spot+perp markets, ranked by 24h turnover "
+                         "(replaces the hardcoded 14-pair list)")
+    ap.add_argument("--universe-size", type=int, default=60,
+                    help="universe size for --universe-auto (default 60)")
+    ap.add_argument("--min-turnover", type=float, default=3_000_000.0,
+                    help="min 24h USDT turnover for universe candidates "
+                         "(default 3M; filters illiquid tails)")
+    ap.add_argument("--no-maker", action="store_true",
+                    help="disable post-only maker execution (back to market orders)")
+    ap.add_argument("--maker-timeout", type=float, default=45.0,
+                    help="seconds to wait per leg for a maker fill before "
+                         "market top-up (default 45)")
+    ap.add_argument("--min-ev", type=float, default=0.0,
+                    help="min entry EV in bps per 8h cycle: funding − basis − "
+                         "amortized fees (default 0 = only EV-positive entries)")
+    ap.add_argument("--entry-window", type=float, default=45.0,
+                    help="open only within N minutes BEFORE a funding slot "
+                         "00/08/16 UTC (default 45; 0 = off)")
+    ap.add_argument("--entry-blackout", type=float, default=10.0,
+                    help="skip opens within N minutes AFTER a funding slot "
+                         "(default 10; 0 = off)")
     return ap
 
 
@@ -165,6 +193,11 @@ def _make_strategy(
         max_hold_hours=args.max_hold_hours,
         open_fail_cooldown_s=args.open_fail_cooldown,
         qty_step=qty_step,
+        maker_enabled=not args.no_maker,
+        maker_timeout_s=args.maker_timeout,
+        min_ev_bps=args.min_ev,
+        entry_window_min=args.entry_window,
+        entry_blackout_min=args.entry_blackout,
         # Fix per-slot equity so one slot's open doesn't shrink the sizing
         # base for the others (and stays stable across rotations).
         paper_equity=per_slot_equity,
@@ -189,24 +222,128 @@ def _ensure_strategy(
     return strat
 
 
+def _sweep_naked_spot(
+    exchange: BybitExchange, universe: set[str], exclude: frozenset[str] = frozenset({"BTCUSDT"}),
+) -> list[str]:
+    """Sell spot coins whose perp hedge is gone (delta must stay neutral).
+
+    2026-08-22 incident: exchange-side stop-losses closed the perp shorts
+    during a rally while the spot legs stayed — ~$120 of naked alt longs sat
+    unnoticed for days (in-memory state still said "hedged"). This sweep runs
+    at startup and on every rotation cycle: any universe coin held on spot
+    WITHOUT an open perp position is sold back to USDT.
+
+    BTCUSDT is excluded by default — the BTC accumulator intentionally holds
+    unhedged spot BTC. Returns the list of swept symbols.
+    """
+    sold: list[str] = []
+    try:
+        balances = exchange.get_all_coin_balances()
+        hedged_syms = {
+            p["symbol"] for p in exchange.get_positions()
+            if abs(_f(p.get("size", 0))) > 0
+        }
+    except Exception as exc:
+        log.warning("naked_spot_sweep_read_failed", error=str(exc))
+        return sold
+    for sym in sorted(universe - set(exclude)):
+        coin = sym[:-4] if sym.endswith("USDT") else ""
+        bal = balances.get(coin, 0.0)
+        if not coin or bal <= 0 or sym in hedged_syms:
+            continue
+        try:
+            lot = exchange.get_instrument_info(sym, category="spot").get("lotSizeFilter", {})
+            step = float(lot.get("basePrecision", "0") or 0)
+            min_qty = float(lot.get("minOrderQty", "0") or 0)
+            if step <= 0:
+                continue
+            decimals = max(0, math.ceil(-math.log10(step))) if step < 1 else 0
+            qty = round(math.floor(bal / step) * step, decimals)
+            if qty < min_qty:
+                continue  # dust below the exchange minimum — ignore
+            exchange.place_spot_order({
+                "symbol": sym, "side": "Sell", "orderType": "Market", "qty": str(qty),
+            })
+            sold.append(sym)
+            print(f"  🧹 [{sym}] naked spot swept: sold {qty} {coin} (perp hedge was gone)")
+            log.warning("naked_spot_swept", symbol=sym, qty=qty)
+        except Exception as exc:
+            log.warning("naked_spot_sell_failed", symbol=sym, error=str(exc))
+    return sold
+
+
+def _discover_universe(
+    exchange: BybitExchange, size: int, min_turnover: float, keep: list[str],
+) -> list[str]:
+    """Auto-discover the carry universe: USDT pairs with BOTH spot + linear
+    perp markets (both legs are required), ranked by 24h turnover and
+    filtered for liquidity. Operator symbols (and anything currently held)
+    are always kept via *keep*. Falls back to *keep* on API failure.
+
+    Phase0: the hardcoded 14-pair list had zero selectivity — the whole
+    top-14 paid the same +0.01% while tail alts print +0.1–0.3%/8h.
+    """
+    try:
+        perp_rows = exchange.get_all_tickers("linear")
+        spot_syms = {
+            t.get("symbol", "") for t in exchange.get_all_tickers("spot")
+            if t.get("symbol", "").endswith("USDT")
+        }
+        rows: list[tuple[str, float]] = []
+        for t in perp_rows:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT") or sym not in spot_syms:
+                continue  # carry needs BOTH legs
+            turnover = _f(t.get("turnover24h"))
+            if turnover < min_turnover:
+                continue  # illiquid tail: wide spreads, maker traps
+            rows.append((sym, turnover))
+        rows.sort(key=lambda r: r[1], reverse=True)
+        universe = [s for s, _ in rows[:size]]
+        for s in keep:
+            if s not in universe:
+                universe.append(s)
+        return universe
+    except Exception as exc:
+        log.warning("universe_discovery_failed", error=str(exc))
+        return list(keep)
+
+
 def _scan_and_rank(
     exchange: BybitExchange, candidates: list[str], top_n: int, min_funding: float,
+    exit_cost_bps: float = 31.0, exit_hold_horizon: int = 10,
 ) -> tuple[list[str], dict[str, float]]:
-    """Scan funding rates for *candidates*; return (top-N symbols, {sym: funding}).
+    """Scan candidates; return (top-N symbols by EV, {sym: EV bps}).
 
-    Only symbols with funding >= *min_funding* are eligible for the top-N.
+    Phase0 EV rotation: rank by projected per-cycle EV = funding −
+    perp-discount basis − amortized round-trip fees, NOT raw funding. Two
+    symbols both paying +0.01% are NOT equal if one has a −20bps perp
+    discount (convergence loss) — the raw funding rank never saw that.
+    ``min_funding`` stays a hard pre-filter (absolute income floor).
     """
+    fee_bps = exit_cost_bps / max(exit_hold_horizon, 1)
     funding_map: dict[str, float] = {}
+    ev_map: dict[str, float] = {}
     for sym in candidates:
         try:
             fr = exchange.get_funding_rate(sym)
-            funding_map[sym] = _f(fr.get("fundingRate"))
+            funding = _f(fr.get("fundingRate"))
+            perp = _f(fr.get("markPrice")) or _f(fr.get("lastPrice"))
+            spot = exchange.get_spot_price(sym) or perp or 0.0
+            funding_map[sym] = funding
+            if perp <= 0 or spot <= 0:
+                continue
+            basis_bps = (perp - spot) / spot * 10_000.0
+            ev_map[sym] = funding * 10_000.0 - max(-basis_bps, 0.0) - fee_bps
         except Exception as exc:  # one bad symbol must not abort the scan
             log.warning("scan_symbol_failed", symbol=sym, error=str(exc))
-    eligible = [(s, f) for s, f in funding_map.items() if f >= min_funding]
+    eligible = [
+        (s, ev_map.get(s, funding_map[s] * 10_000.0 - fee_bps))
+        for s, f in funding_map.items() if f >= min_funding
+    ]
     eligible.sort(key=lambda x: x[1], reverse=True)
     top = [s for s, _ in eligible[:top_n]]
-    return top, funding_map
+    return top, ev_map
 
 
 def _notify_action(sym: str, act: CarryAction, no_notify: bool) -> None:
@@ -250,6 +387,9 @@ def main() -> None:
     if not dynamic and not symbols:
         print("Error: no symbols specified.")
         return
+    if args.universe_auto and not dynamic:
+        print("Error: --universe-auto requires --top-n rotation mode.")
+        return
     n = args.top_n if dynamic else len(symbols)
 
     # Safety: require explicit confirmation for real-money mainnet trading.
@@ -278,19 +418,41 @@ def main() -> None:
         total_equity = args.paper_equity
         free_equity = total_equity
     else:
-        try:
-            res = exchange.get_wallet_balance("USDT")
-            coin = res["list"][0]["coin"][0]
-            total_equity = float(coin.get("walletBalance", 0.0))
-            # Margin already locked in open perp positions is NOT available for
-            # new spot buys. Size from the truly free balance so existing
-            # hedges don't make the bot attempt opens it can't afford
-            # (Bybit rejects with "Insufficient balance" ErrCode 170131).
-            locked_im = float(coin.get("totalPositionIM", 0.0))
-            free_equity = max(total_equity - locked_im, 0.0)
-        except Exception:
-            total_equity = 0.0
-            free_equity = 0.0
+        # P0 fix (2026-08-22 incident): a single failed wallet read at boot
+        # (DNS not up yet → NameResolutionError) used to bake in $0.00/slot
+        # FOREVER — equity is read once and never refreshed, so no new
+        # positions could open for days while the bot looked healthy.
+        # Retry with backoff; if the wallet stays unreadable, exit non-zero
+        # and let systemd (Restart=always) relaunch us once the network is up.
+        total_equity = 0.0
+        free_equity = 0.0
+        wallet_ok = False
+        for attempt in range(1, 11):
+            try:
+                res = exchange.get_wallet_balance("USDT")
+                coin = res["list"][0]["coin"][0]
+                total_equity = float(coin.get("walletBalance", 0.0))
+                # Margin already locked in open perp positions is NOT available for
+                # new spot buys. Size from the truly free balance so existing
+                # hedges don't make the bot attempt opens it can't afford
+                # (Bybit rejects with "Insufficient balance" ErrCode 170131).
+                locked_im = float(coin.get("totalPositionIM", 0.0))
+                free_equity = max(total_equity - locked_im, 0.0)
+                wallet_ok = True
+                break
+            except Exception as exc:
+                wait = backoff_seconds(attempt, base=5.0, cap=60.0)
+                print(f"  ⚠️  wallet read failed (attempt {attempt}/10): {exc} "
+                      f"— retry in {wait:.0f}s")
+                log.warning("startup_wallet_read_failed", attempt=attempt, error=str(exc))
+                time.sleep(wait)
+        if not wallet_ok:
+            print("  ✖ wallet unreadable after 10 attempts — exiting; "
+                  "systemd will restart us when the network is back")
+            log.error("startup_wallet_read_exhausted")
+            if not args.no_notify:
+                _notify("🛑 Carry MULTI: wallet unreadable at startup — exiting for restart")
+            raise SystemExit(3)
     per_slot_equity = free_equity / n if n > 0 else 0.0
     print(f"  capital: wallet ${total_equity:.2f} - locked margin "
           f"${total_equity - free_equity:.2f} = free ${free_equity:.2f} "
@@ -299,6 +461,16 @@ def main() -> None:
         print(f"  ⚠️  free capital too low for {n} slots "
               f"(need ≥${args.min_notional / args.equity_fraction:.0f}/slot); "
               f"will monitor existing positions, new opens skipped")
+
+    # Phase0: universe auto-discovery (needs the exchange, hence here).
+    if args.universe_auto:
+        keep = list(dict.fromkeys(symbols + candidates))
+        candidates = _discover_universe(
+            exchange, args.universe_size, args.min_turnover, keep,
+        )
+        print(f"  🔭 universe: auto-discovered {len(candidates)} liquid pairs "
+              f"(top by turnover: {', '.join(candidates[:8])}…)")
+        log.info("universe_discovered", size=len(candidates))
 
     # ------------------------------------------------------------------
     # BTC accumulator — auto-convert funding profits to BTC spot
@@ -329,12 +501,16 @@ def main() -> None:
             _ensure_strategy(pool, exchange, sym, args, per_slot_equity)
             can_open[sym] = True
     else:
-        top, fmap = _scan_and_rank(exchange, candidates, args.top_n, args.min_funding)
+        top, fmap = _scan_and_rank(
+            exchange, candidates, args.top_n, args.min_funding,
+            exit_cost_bps=31.0, exit_hold_horizon=10,
+        )
         for sym in top:
             _ensure_strategy(pool, exchange, sym, args, per_slot_equity)
             can_open[sym] = True
-        print(f"  rotation: initial top-{args.top_n}: {', '.join(top) or '(none eligible)'}")
-        log.info("carry_rotation_initial", top_n=top, funding=fmap)
+        print(f"  rotation: initial top-{args.top_n} (by EV): "
+              f"{', '.join(top) or '(none eligible)'}")
+        log.info("carry_rotation_initial", top_n=top, ev_bps=fmap)
 
     # ------------------------------------------------------------------
     # Reconcile existing positions from a previous run (or a symbol that
@@ -352,6 +528,13 @@ def main() -> None:
                     log.info("carry_reconcile_existing", symbol=sym, can_open=False)
         except Exception as exc:
             log.warning("reconcile_existing_failed", error=str(exc))
+
+    # P0 fix (2026-08-22 incident): sell any spot coin left over from a perp
+    # that was closed exchange-side (stop-loss / liquidation / manual).
+    if not args.dry_run:
+        swept = _sweep_naked_spot(exchange, set(candidates) | set(pool))
+        if swept and not args.no_notify:
+            _notify(f"🧹 Startup: naked spot swept to USDT: {', '.join(swept)}")
 
     # ------------------------------------------------------------------
     # Banner
@@ -377,6 +560,16 @@ def main() -> None:
         _notify(f"🤖 Carry MULTI started | {n} slots | {mode} | {rot} | "
                 f"poll {args.interval}s | ${per_slot_equity:.0f}/slot")
 
+    # First PnL snapshot right away — don't wait a full heartbeat cycle
+    # (~2h) before the dashboard equity chart gets a fresh point.
+    if args.pnl_log and not args.dry_run:
+        try:
+            snap = _pnl_snapshot(exchange)
+            if snap is not None:
+                _pnl_append(args.pnl_log, snap)
+        except Exception as exc:
+            log.warning("pnl_snapshot_failed", error=str(exc))
+
     # ------------------------------------------------------------------
     # Main loop — poll every strategy in the pool each cycle
     # ------------------------------------------------------------------
@@ -387,7 +580,16 @@ def main() -> None:
 
         # --- Dynamic rotation: re-rank candidates every N polls ---------
         if dynamic and args.rebalance_cycles > 0 and _poll_count % args.rebalance_cycles == 0:
-            top, fmap = _scan_and_rank(exchange, candidates, args.top_n, args.min_funding)
+            if args.universe_auto:
+                # Re-discover daily-ish (new listings gain both legs over time).
+                candidates = _discover_universe(
+                    exchange, args.universe_size, args.min_turnover,
+                    list(dict.fromkeys(symbols + candidates)),
+                )
+            top, fmap = _scan_and_rank(
+                exchange, candidates, args.top_n, args.min_funding,
+                exit_cost_bps=31.0, exit_hold_horizon=10,
+            )
             for sym in list(can_open):
                 can_open[sym] = sym in top
             for sym in top:
@@ -397,7 +599,35 @@ def main() -> None:
             hedged = [s for s, st in pool.items() if st.state.value == "hedged"]
             print(f"🔄 rotation #{_poll_count}: top-{args.top_n}={active} | "
                   f"hedged={hedged or 'none'}")
-            log.info("carry_rotation", top_n=active, hedged=hedged, funding=fmap)
+            log.info("carry_rotation", top_n=active, hedged=hedged, ev_bps=fmap)
+
+            # P0 fix (2026-08-22 incident): exchange-side stop-losses can close
+            # a perp at any time. The in-memory HEDGED state used to live on
+            # blindly ("holding" positions that no longer existed) while the
+            # naked spot leg sat unmonitored. Re-verify every hedged slot
+            # against the exchange each rotation cycle, and sweep any spot
+            # coin left without its perp hedge.
+            if not args.dry_run:
+                for sym, strat in list(pool.items()):
+                    if strat.state.value != "hedged":
+                        continue
+                    try:
+                        still_hedged = any(
+                            abs(_f(p.get("size", 0))) > 0
+                            for p in exchange.get_positions(sym)
+                            if p.get("symbol") == sym
+                        )
+                        if not still_hedged:
+                            msg = strat.reconcile()
+                            print(f"  ↻ [{sym}] perp gone — reconcile: {msg}")
+                            log.warning("carry_perp_lost", symbol=sym, result=msg)
+                            if not args.no_notify:
+                                _notify(f"⚠️ {sym}: perp hedge gone — {msg}")
+                    except Exception as exc:
+                        log.warning("loop_reconcile_failed", symbol=sym, error=str(exc))
+                swept = _sweep_naked_spot(exchange, set(candidates) | set(pool))
+                if swept and not args.no_notify:
+                    _notify(f"🧹 Naked spot swept to USDT: {', '.join(swept)}")
 
         # --- Poll every tracked symbol ----------------------------------
         for sym, strat in list(pool.items()):

@@ -152,6 +152,45 @@ class BybitExchange:
         lst = res.get("list", [])
         return lst[0] if lst else {}
 
+    def get_all_tickers(self, category: str = "linear") -> list[dict[str, Any]]:
+        """All tickers for a category (no symbol filter).
+
+        Used by the universe auto-discovery to find every USDT pair with both
+        spot + linear markets, ranked by 24h turnover. Public endpoint.
+        """
+        res = self._request("get_tickers", category=category)
+        return res.get("list", [])
+
+    def get_order_status(
+        self, symbol: str, order_link_id: str, category: str = "linear",
+    ) -> dict[str, Any]:
+        """One order's live state by client id (maker fill polling).
+
+        Returns a dict with ``orderStatus`` (New/PartiallyFilled/Filled/
+        Cancelled/Rejected), ``cumExecQty`` (filled qty) and ``avgPrice``.
+        ``openOnly=0`` makes the endpoint also return recently closed orders,
+        so a fill/cancel between polls is never missed. Empty dict = unknown.
+        """
+        try:
+            res = self._request(
+                "get_open_orders", category=category, symbol=symbol,
+                orderLinkId=order_link_id, openOnly=0,
+            )
+            lst = res.get("list", [])
+            return lst[0] if lst else {}
+        except ExchangeError:
+            return {}
+
+    def get_touch(self, symbol: str, category: str) -> dict[str, Any]:
+        """Best bid/ask snapshot for one symbol (``bid1Price``/``ask1Price``).
+
+        Used by the maker-execution path to join the touch with post-only
+        limits. Public endpoint. Empty dict = unknown.
+        """
+        res = self._request("get_tickers", category=category, symbol=symbol)
+        lst = res.get("list", [])
+        return lst[0] if lst else {}
+
     def get_spot_price(self, symbol: str) -> float | None:
         """Last traded price on the spot market (for basis / hedge calc)."""
         res = self._request("get_tickers", category="spot", symbol=symbol)
@@ -178,8 +217,12 @@ class BybitExchange:
         ``{coin, wallet_balance, usd_value, unrealised_pnl}``.  Best-effort:
         returns ``(0.0, [])`` on any read failure.
         """
+        # NOTE: unfiltered request (no coin= param). get_wallet_balance()
+        # defaults to coin="USDT", which used to hide every other coin —
+        # the dashboard's per-coin list and uPnL math were USDT-only and
+        # never showed the spot hedge legs (2026-08-22 fix).
         try:
-            res = self.get_wallet_balance()
+            res = self._request("get_wallet_balance", accountType="UNIFIED")
             acct = res["list"][0]
             total = float(acct.get("totalEquity", 0.0) or 0.0)
             coins: list[dict[str, float | str]] = []
@@ -193,6 +236,25 @@ class BybitExchange:
             return total, coins
         except (KeyError, IndexError, TypeError, ValueError):
             return 0.0, []
+
+    def get_all_coin_balances(self) -> dict[str, float]:
+        """Non-zero wallet balances for EVERY coin in the unified account.
+
+        Unlike :meth:`get_wallet_balance` (which filters server-side to one
+        coin) this returns the full map ``{coin: walletBalance}`` — needed by
+        the naked-spot sweep to spot hedge legs that lost their perp side.
+        Best-effort: returns ``{}`` on any read failure.
+        """
+        try:
+            res = self._request("get_wallet_balance", accountType="UNIFIED")
+            out: dict[str, float] = {}
+            for c in res["list"][0].get("coin", []):
+                bal = float(c.get("walletBalance", 0.0) or 0.0)
+                if bal > 0:
+                    out[str(c.get("coin", ""))] = bal
+            return out
+        except (KeyError, IndexError, TypeError, ValueError):
+            return {}
 
     def get_api_key_info(self) -> dict[str, Any]:
         """Query the current API key's metadata + permission scope (P3-13).
@@ -324,10 +386,22 @@ class BybitExchange:
         """Submit a spot order (the long hedge leg of the carry pair)."""
         return self._request("place_order", category="spot", **params)
 
-    def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        return self._request(
-            "cancel_order", category="linear", symbol=symbol, orderId=order_id
-        )
+    def cancel_order(
+        self, order_id: str, symbol: str, category: str = "linear",
+    ) -> dict[str, Any]:
+        """Cancel an open order (linear or spot). Best-effort.
+
+        Bybit returns 110007 when the order is already filled/cancelled —
+        treat that as success (the goal state is 'no live order').
+        """
+        try:
+            return self._request(
+                "cancel_order", category=category, symbol=symbol, orderId=order_id
+            )
+        except ExchangeError as exc:
+            if "110007" in str(exc):
+                return {}
+            raise
 
     def close(self) -> None:
         """Release the underlying HTTP session."""

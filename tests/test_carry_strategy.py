@@ -8,7 +8,7 @@ import pytest
 from core.carry_strategy import CarryAction, CarryConfig, CarryState, CarryStrategy
 
 
-def _mock_exchange(funding=0.0002, perp=65000.0, spot=65000.0, equity=10000.0,
+def _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0, equity=10000.0,
                    perp_size=0.0, spot_btc=0.0):
     ex = MagicMock()
     ex.get_funding_rate.return_value = {
@@ -29,13 +29,21 @@ def _mock_exchange(funding=0.0002, perp=65000.0, spot=65000.0, equity=10000.0,
     )
     ex.place_order.return_value = {"orderId": "perp-1"}
     ex.place_spot_order.return_value = {"orderId": "spot-1"}
+    # Phase0 maker path: no touch / no order state → every leg falls back to
+    # a plain market order (the pre-maker behaviour these tests assert on).
+    # Default funding 0.0005 (5bps) clears the EV gate: 5 − 0 − 3.1 > 0.
+    ex.get_touch.return_value = {}
+    ex.get_order_status.return_value = {}
+    ex.get_instrument_info.return_value = {
+        "lotSizeFilter": {"basePrecision": "0.00001", "minOrderQty": "0.00001"},
+    }
     return ex
 
 
 # ---------------- entry logic --------------------
 
 def test_opens_when_funding_favorable():
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
     act = s.decide()
@@ -56,7 +64,7 @@ def test_stays_flat_when_funding_too_low():
 
 
 def test_no_open_when_zero_equity():
-    ex = _mock_exchange(funding=0.0003, equity=0.0)
+    ex = _mock_exchange(funding=0.0005, equity=0.0)
     s = CarryStrategy(ex)
     act = s.decide()
     assert act.action == "none"
@@ -67,7 +75,7 @@ def test_no_open_when_zero_equity():
 
 def test_basis_guard_flattens_on_squeeze():
     """Perp premium > 50 bps while HEDGED → close (liquidation protection)."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(basis_guard_bps=50.0))
     s.decide()  # open
     assert s.state == CarryState.HEDGED
@@ -84,7 +92,7 @@ def test_basis_guard_flattens_on_squeeze():
 
 def test_holds_when_basis_within_guard():
     """Small premium (< guard) while HEDGED → keep holding."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(basis_guard_bps=50.0, rebalance_drift_bps=200.0))
     s.decide()  # open at basis 0
     ex.get_funding_rate.return_value = {
@@ -100,7 +108,7 @@ def test_holds_when_basis_within_guard():
 
 def test_exits_when_funding_turns_negative():
     """Severe negative funding (projected loss > close cost) triggers exit."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=1))
     s.decide()  # open
@@ -115,7 +123,7 @@ def test_exits_when_funding_turns_negative():
 
 def test_mild_negative_funding_holds():
     """Negative funding below threshold but projected loss < close cost → hold."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=1))
     s.decide()  # open
@@ -130,7 +138,7 @@ def test_mild_negative_funding_holds():
 
 def test_exit_requires_confirmation():
     """Severe negative funding requires exit_confirm_polls consecutive warrants."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=3))
     s.decide()  # open
@@ -146,7 +154,7 @@ def test_exit_requires_confirmation():
 
 def test_exit_counter_resets_on_recovery():
     """If funding recovers before confirmation, the exit counter resets."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         close_funding=-0.0001, rebalance_drift_bps=200.0, exit_confirm_polls=3))
     s.decide()  # open
@@ -171,7 +179,7 @@ def test_exit_counter_resets_on_recovery():
 # ---------------- rebalance --------------------
 
 def test_rebalance_on_hedge_drift():
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(rebalance_drift_bps=20.0, basis_guard_bps=200.0))
     s.decide()  # open at basis 0
     # Drift +30 bps (above 20 rebalance, below 200 guard)
@@ -228,7 +236,7 @@ def test_rebalance_skips_when_within_tolerance():
 # ---------------- execution --------------------
 
 def test_execute_open_places_both_legs():
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     # Disable conviction scaling here to isolate leg-placement behaviour.
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0))
@@ -247,7 +255,7 @@ def test_execute_open_places_both_legs():
 
 
 def test_run_once_decides_and_executes():
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
     act = s.run_once()
     assert act.action == "open"
@@ -258,7 +266,7 @@ def test_run_once_decides_and_executes():
 
 def test_trade_log_written_on_open(tmp_path: Path):
     log_path = str(tmp_path / "trades.csv")
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001, trade_log=log_path))
     s.run_once()
     assert Path(log_path).exists()
@@ -266,13 +274,13 @@ def test_trade_log_written_on_open(tmp_path: Path):
         rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["action"] == "open"
-    assert float(rows[0]["funding_rate"]) == 0.0003
+    assert float(rows[0]["funding_rate"]) == 0.0005
     assert float(rows[0]["perp_price"]) == 65000.0
 
 
 def test_no_trade_log_when_disabled(tmp_path: Path):
     log_path = str(tmp_path / "trades.csv")
-    ex = _mock_exchange(funding=0.0003)
+    ex = _mock_exchange(funding=0.0005)
     s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
     s.run_once()
     assert not Path(log_path).exists()
@@ -280,7 +288,7 @@ def test_no_trade_log_when_disabled(tmp_path: Path):
 
 def test_trade_log_close_appends_row(tmp_path: Path):
     log_path = str(tmp_path / "trades.csv")
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, trade_log=log_path, exit_confirm_polls=1))
     s.run_once()
@@ -300,7 +308,7 @@ def test_trade_log_close_appends_row(tmp_path: Path):
 
 def test_open_rolls_back_perp_if_spot_fails():
     """If the spot hedge fails, the perp short must be closed immediately."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     ex.place_spot_order.side_effect = RuntimeError("spot failed")
     s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
     act = s.decide()
@@ -323,7 +331,7 @@ def test_open_failure_triggers_cooldown_no_churn():
     real orders/fees. After the fix the next decide() must return "none" while
     the cooldown is active, and NO third order is placed.
     """
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     ex.place_spot_order.side_effect = RuntimeError("spot failed")
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, open_fail_cooldown_s=600.0,
@@ -349,7 +357,7 @@ def test_decide_survives_market_data_failure():
     untouched) instead of raising — otherwise one network hiccup kills the poll
     and, in the runner, cascades into the error/backoff path every cycle.
     """
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     ex.get_funding_rate.side_effect = RuntimeError("api down")
     s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
     act = s.decide()
@@ -364,7 +372,7 @@ def test_decide_survives_market_data_failure():
 
 def test_high_confidence_sizes_up():
     """Strong funding + low basis → full confidence → max multiplier."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=10000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0, equity=10000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, strong_funding=0.0003,
         size_mult_min=0.5, size_mult_max=1.5,
@@ -382,6 +390,7 @@ def test_low_confidence_sizes_down():
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, basis_guard_bps=50.0,
         strong_funding=0.0003, size_mult_min=0.5, size_mult_max=1.5,
+        min_ev_bps=-10.0,  # sizing test — bypass the Phase0 EV gate
     ))
     act = s.decide()
     assert act.action == "open"
@@ -392,7 +401,7 @@ def test_low_confidence_sizes_down():
 
 def test_max_notional_caps_scaled_size():
     """Confidence scaling can never breach the max_notional hard cap."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=100000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0, equity=100000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, max_notional=70.0,
         strong_funding=0.0003, size_mult_min=0.5, size_mult_max=1.5,
@@ -404,7 +413,7 @@ def test_max_notional_caps_scaled_size():
 
 def test_confidence_logged(tmp_path: Path):
     log_path = str(tmp_path / "trades.csv")
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, trade_log=log_path,
         size_mult_min=1.0, size_mult_max=1.0,
@@ -486,7 +495,7 @@ def test_close_failure_keeps_hedged_state():
     resetting state would make the next poll OPEN a duplicate.  _close() must
     leave state HEDGED and return None (no trade-log row for a non-close).
     """
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, exit_confirm_polls=1))
     s.run_once()  # open
@@ -514,7 +523,7 @@ def test_open_hedges_actual_perp_fill():
     the requested qty would leave an unhedged delta; _open() reads the actual
     perp size after the fill and hedges that.
     """
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     # decide() computes qty 0.076 from equity, but the exchange fills only 0.070.
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0,
@@ -534,7 +543,7 @@ def test_open_hedges_actual_perp_fill():
 
 def test_open_falls_back_to_requested_qty_when_fill_unreadable():
     """C3: if the real fill can't be read, hedge the requested qty (best-effort)."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001, size_mult_min=1.0, size_mult_max=1.0,
         spot_taker_fee=0.0))  # isolate C3 fill check from P3-15 fee gross-up
@@ -549,7 +558,7 @@ def test_open_falls_back_to_requested_qty_when_fill_unreadable():
 
 def test_orders_carry_unique_orderlink_id():
     """C3: every order carries a unique orderLinkId for traceability/idempotency."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(equity_fraction=0.5, qty_step=0.001))
     act = s.decide()
     s.execute(act)
@@ -570,7 +579,7 @@ def test_open_grosses_up_spot_for_taker_fee():
     received BTC (after the taker fee deducted from the base coin) matches
     the perp short size, keeping the hedge truly delta-neutral.
     """
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001,
         size_mult_min=1.0, size_mult_max=1.0,
@@ -586,7 +595,7 @@ def test_open_grosses_up_spot_for_taker_fee():
 
 def test_open_no_grossup_when_fee_zero():
     """P3-15: with spot_taker_fee=0 the order is the plain hedge_qty×price."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001,
         size_mult_min=1.0, size_mult_max=1.0,
@@ -606,7 +615,7 @@ def test_position_size_cleans_float_artifacts():
     ``1.2000000000000002`` in raw float math, which Bybit rejects. The sizer
     must round back to the step's own decimal precision.
     """
-    ex = _mock_exchange(funding=0.0003, perp=4100.0, spot=4100.0, equity=10000.0)
+    ex = _mock_exchange(funding=0.0005, perp=4100.0, spot=4100.0, equity=10000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.1,
         size_mult_min=1.0, size_mult_max=1.0,
@@ -625,7 +634,7 @@ def test_min_notional_skips_tiny_open():
     with 'Insufficient balance' / min-order errors, churning open→rollback.
     """
     # Tiny equity: 10000 × 0.5% fraction = 50 notional → but cap forces tiny qty.
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=100.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0, equity=100.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001,
         size_mult_min=1.0, size_mult_max=1.0,
@@ -639,7 +648,7 @@ def test_min_notional_skips_tiny_open():
 
 def test_min_notional_allows_healthy_open():
     """A normal-sized position (notional well above min) opens as usual."""
-    ex = _mock_exchange(funding=0.0003, perp=65000.0, spot=65000.0, equity=10000.0)
+    ex = _mock_exchange(funding=0.0005, perp=65000.0, spot=65000.0, equity=10000.0)
     s = CarryStrategy(ex, CarryConfig(
         equity_fraction=0.5, qty_step=0.001,
         size_mult_min=1.0, size_mult_max=1.0,

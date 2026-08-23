@@ -92,6 +92,23 @@ class CarryConfig:
     # spot leg ~fee% shorter than the perp short → a small unhedged delta. We
     # gross up the USDT order by 1/(1-fee) so the NET received BTC matches.
     spot_taker_fee: float = 0.001  # 0.1% (Bybit VIP0 spot taker)
+    # --- Phase0: maker execution (perp taker 0.055% → maker 0.02%, −64%) ---
+    # Rest post-only limits joining the touch; on timeout cancel and top up
+    # the remainder with a market order. Basis-guard closes always bypass
+    # to market (emergencies must cross the spread immediately).
+    maker_enabled: bool = True
+    maker_timeout_s: float = 45.0  # per-leg wait before market top-up
+    maker_poll_s: float = 1.5  # fill-poll interval while the order rests
+    # --- Phase0: EV entry gate — open only when the projected per-cycle EV
+    # (funding − perp-discount basis − amortized round-trip fees, in bps)
+    # exceeds this. 0.0 = only EV-positive entries.
+    min_ev_bps: float = 0.0
+    # --- Phase0: funding-slot entry timing (slots at 00/08/16 UTC) ---
+    # Open only within N minutes BEFORE a slot (captures the known rate at
+    # the next payment) and skip the volatile minutes right AFTER a slot.
+    # 0 disables the respective check.
+    entry_window_min: float = 45.0
+    entry_blackout_min: float = 10.0
 
     @property
     def base_coin(self) -> str:
@@ -122,6 +139,21 @@ def _basis_bps(perp_price: float, spot_price: float) -> float:
     return (perp_price - spot_price) / spot_price * 10_000.0
 
 
+def _fmt_step(qty: float, step: float) -> str:
+    """Format *qty* rounded DOWN to the exchange lot *step* as a string.
+
+    Bybit rejects quantities with more precision than the instrument's lot
+    step. ``step <= 0`` means "unknown" → 8 decimals (spot base precision
+    fallback). Always floors so the rounded order never exceeds the intended
+    size (a larger SELL can fail on balance, a larger BUY on margin).
+    """
+    if step <= 0:
+        return f"{qty:.8f}".rstrip("0").rstrip(".") or "0"
+    q = math.floor(qty / step + 1e-9) * step
+    decimals = max(0, math.ceil(-math.log10(step))) if step < 1 else 0
+    return f"{q:.{decimals}f}"
+
+
 class CarryStrategy:
     """Delta-neutral funding carry with basis-guard risk control."""
 
@@ -135,6 +167,7 @@ class CarryStrategy:
         self._entry_time: float | None = None  # epoch seconds when position opened
         self._poll_count: int = 0  # total decide() calls (for throttling checks)
         self._open_fail_until: float = 0.0  # epoch until which new opens are suppressed
+        self._spot_step_cache: float | None = None  # spot basePrecision (lazy)
 
     # ------------------------------------------------------------------
     # Startup reconciliation (P0-1)
@@ -310,11 +343,21 @@ class CarryStrategy:
             log.warning("decide_market_data_failed", error=str(exc))
             return CarryAction("none", f"market data unavailable: {exc}")
         basis = _basis_bps(perp_price, spot_price)
+        # Phase0 funding-slot timing: minutes until the next payment
+        # (00/08/16 UTC). None = unknown → timing gates fail OPEN (a missing
+        # field must never block entries).
+        next_funding_ms = _safe_float(fr.get("nextFundingTime"))
+        mins_to_funding = (
+            (next_funding_ms / 1000.0 - time.time()) / 60.0
+            if next_funding_ms > 0 else None
+        )
 
         if self.state == CarryState.HEDGED:
             act = self._decide_hedged(funding, basis)
         elif can_open:
-            act = self._decide_flat(funding, basis, perp_price or spot_price)
+            act = self._decide_flat(
+                funding, basis, perp_price or spot_price, mins_to_funding,
+            )
         else:
             act = CarryAction("none", "rotation: not in top-N",
                               funding_rate=funding, basis_bps=basis)
@@ -394,7 +437,25 @@ class CarryStrategy:
         # 4) Hold and collect.
         return CarryAction("none", "holding", funding_rate=funding, basis_bps=basis)
 
-    def _decide_flat(self, funding: float, basis: float, price: float) -> CarryAction:
+    def _entry_ev_bps(self, funding: float, basis_bps: float) -> float:
+        """Projected EV of ONE hold cycle, in bps of notional.
+
+        ``funding income − perp-discount basis − round-trip fees amortized
+        over ``exit_hold_horizon`` cycles``. A perp trading BELOW spot at
+        entry locks in a convergence loss for the short leg (cost); a perp
+        premium is entry-positive but is left out here (conservative — the
+        basis guard also treats big premiums as risk, not free money).
+        Positive EV = worth opening.
+        """
+        funding_bps = funding * 10_000.0
+        basis_cost = max(-basis_bps, 0.0)
+        fee_bps = self.cfg.exit_cost_bps / max(self.cfg.exit_hold_horizon, 1)
+        return funding_bps - basis_cost - fee_bps
+
+    def _decide_flat(
+        self, funding: float, basis: float, price: float,
+        mins_to_funding: float | None = None,
+    ) -> CarryAction:
         # Re-entry guard: after a failed open (a leg was rejected), back off for
         # open_fail_cooldown_s so a failing market can't trigger an open→rollback
         # churn loop every poll. Existing HEDGED positions are unaffected (they
@@ -410,6 +471,36 @@ class CarryStrategy:
                 "none", f"funding {funding*100:.4f}% < {self.cfg.min_funding_to_open*100:.4f}%",
                 funding_rate=funding, basis_bps=basis,
             )
+        # Phase0 EV gate: funding must beat basis cost + amortized fees.
+        # Raw funding-rank entries at 0.01%/8h are EV-NEGATIVE with taker
+        # fees (31bps round-trip) — the single biggest profitability leak.
+        ev = self._entry_ev_bps(funding, basis)
+        if ev < self.cfg.min_ev_bps:
+            return CarryAction(
+                "none",
+                f"EV {ev:.1f}bps < {self.cfg.min_ev_bps:.1f}bps "
+                f"(funding {funding*1e4:.1f} − basis {max(-basis, 0.0):.1f} "
+                f"− fees {self.cfg.exit_cost_bps / max(self.cfg.exit_hold_horizon, 1):.1f})",
+                funding_rate=funding, basis_bps=basis,
+            )
+        # Phase0 funding-slot timing: enter shortly BEFORE a slot to capture
+        # the known rate immediately; skip the volatile minutes right after.
+        if mins_to_funding is not None:
+            if (self.cfg.entry_blackout_min > 0
+                    and mins_to_funding > 480.0 - self.cfg.entry_blackout_min):
+                return CarryAction(
+                    "none",
+                    f"funding blackout ({480.0 - mins_to_funding:.0f}m after slot)",
+                    funding_rate=funding, basis_bps=basis,
+                )
+            if (self.cfg.entry_window_min > 0
+                    and mins_to_funding > self.cfg.entry_window_min):
+                return CarryAction(
+                    "none",
+                    f"awaiting funding slot ({mins_to_funding:.0f}m left, "
+                    f"window {self.cfg.entry_window_min:.0f}m)",
+                    funding_rate=funding, basis_bps=basis,
+                )
         confidence = self._entry_confidence(funding, basis)
         qty = self._position_size(price, confidence)
         if qty <= 0:
@@ -430,7 +521,7 @@ class CarryStrategy:
         return CarryAction(
             "open",
             f"funding {funding*100:.4f}% ≥ {self.cfg.min_funding_to_open*100:.4f}% "
-            f"(conf {confidence:.0%})",
+            f"(conf {confidence:.0%}, EV {ev:.1f}bps)",
             perp_side="Sell",  # short perpetual
             spot_side="Buy",  # long spot hedge
             qty=qty,
@@ -525,55 +616,250 @@ class CarryStrategy:
         ts = int(time.time() * 1000)
         return f"{self.cfg.symbol.lower()}-{leg}-{ts}"[-36:]
 
+    # ------------------------------------------------------------------
+    # Maker execution (Phase0): post-only at the touch, market fallback.
+    # Perp fees drop taker 0.055% → maker 0.02% (−64%); spot keeps its
+    # 0.1% VIP0 fee but avoids crossing the spread.
+    # ------------------------------------------------------------------
+    def _touch_price(self, category: str, side: str) -> str | None:
+        """Best bid/ask as a string ready for a limit order (None = unknown).
+
+        Joining the touch with PostOnly guarantees maker pricing: a Sell at
+        ask1 / Buy at bid1 never crosses the book, and the touch price is by
+        definition a valid tick (no rounding needed).
+        """
+        try:
+            t = self.exchange.get_touch(self.cfg.symbol, category)
+            key = "ask1Price" if side == "Sell" else "bid1Price"
+            p = str(t.get(key, "") or "").strip()
+            return p or None
+        except Exception as exc:
+            log.warning("maker_touch_failed", category=category, error=str(exc))
+            return None
+
+    def _spot_qty_step(self) -> float:
+        """Spot base lot step (basePrecision), cached. 0 = unknown."""
+        if self._spot_step_cache is None:
+            try:
+                lot = self.exchange.get_instrument_info(
+                    self.cfg.symbol, category="spot",
+                ).get("lotSizeFilter", {})
+                self._spot_step_cache = float(lot.get("basePrecision", "0") or 0)
+            except Exception:
+                self._spot_step_cache = 0.0
+        return self._spot_step_cache
+
+    def _rest_maker(
+        self, category: str, side: str, qty_str: str, price: str,
+        *, reduce_only: bool, leg: str,
+    ) -> tuple[dict | None, str]:
+        """Place a PostOnly limit at the touch. (None, link) = rejected.
+
+        A PostOnly order that would cross is rejected instantly by Bybit —
+        the caller then falls back to a market order.
+        """
+        place = (self.exchange.place_spot_order if category == "spot"
+                 else self.exchange.place_order)
+        params: dict = {
+            "symbol": self.cfg.symbol, "side": side,
+            "orderType": "Limit", "qty": qty_str, "price": price,
+            "timeInForce": "PostOnly",
+            "orderLinkId": self._order_link_id(leg),
+        }
+        if reduce_only:
+            params["reduceOnly"] = True
+        try:
+            return place(params), params["orderLinkId"]
+        except Exception as exc:
+            log.warning("maker_place_rejected", leg=leg, error=str(exc))
+            return None, params["orderLinkId"]
+
+    def _await_maker(self, link: str, order: dict, category: str) -> float:
+        """Poll a resting maker order; cancel on timeout. Returns filled qty.
+
+        Returns as soon as the order is Filled/Cancelled/Rejected, or after
+        ``maker_timeout_s`` (cancel first — idempotent — then re-read the
+        final cumExecQty so a fill racing the cancel is never lost).
+        """
+        order_id = str(order.get("orderId", ""))
+        deadline = time.time() + self.cfg.maker_timeout_s
+        filled = 0.0
+        while time.time() < deadline:
+            st = self.exchange.get_order_status(self.cfg.symbol, link, category)
+            status = str(st.get("orderStatus", ""))
+            filled = _safe_float(st.get("cumExecQty"))
+            if status == "Filled":
+                return filled
+            if status in ("Cancelled", "Rejected"):
+                break
+            time.sleep(self.cfg.maker_poll_s)
+        if order_id:
+            try:
+                self.exchange.cancel_order(order_id, self.cfg.symbol, category)
+            except Exception as exc:
+                log.warning("maker_cancel_failed", order_id=order_id, error=str(exc))
+            st = self.exchange.get_order_status(self.cfg.symbol, link, category)
+            return max(filled, _safe_float(st.get("cumExecQty")))
+        return filled
+
+    def _market_perp(self, side: str, qty: float, *, reduce_only: bool) -> dict:
+        """Market perp order with lot-step rounding (the old default path)."""
+        params: dict = {
+            "symbol": self.cfg.symbol, "side": side,
+            "orderType": "Market", "qty": _fmt_step(qty, self.cfg.qty_step),
+            "orderLinkId": self._order_link_id(f"mkt-{side.lower()}"),
+        }
+        if reduce_only:
+            params["reduceOnly"] = True
+        return self.exchange.place_order(params)
+
+    def _market_spot_buy(self, base_qty: float, price: float) -> dict:
+        """Market spot BUY (Bybit takes QUOTE/USDT qty) with fee gross-up."""
+        fee = self.cfg.spot_taker_fee
+        gross = base_qty * price / (1.0 - fee) if fee > 0 else base_qty * price
+        spot_qty_usdt = round(gross, 2) if price > 0 else 0.0
+        return self.exchange.place_spot_order({
+            "symbol": self.cfg.symbol, "side": "Buy",
+            "orderType": "Market", "qty": str(spot_qty_usdt),
+            "orderLinkId": self._order_link_id("open-spot"),
+        })
+
+    def _market_spot_sell(self, qty: float) -> dict:
+        """Market spot SELL (base-currency qty)."""
+        return self.exchange.place_spot_order({
+            "symbol": self.cfg.symbol, "side": "Sell",
+            "orderType": "Market", "qty": str(round(qty, 8)),
+            "orderLinkId": self._order_link_id("close-spot"),
+        })
+
+    def _maker_short_perp(self, qty: float) -> tuple[float, dict | None]:
+        """Open the perp short: PostOnly Sell at ask1, market top-up.
+
+        Returns (filled_qty, last_order). When the maker path is skipped or
+        unavailable the whole qty goes market and the caller verifies the
+        real fill via _actual_perp_size().
+        """
+        if not self.cfg.maker_enabled or qty <= 0:
+            return 0.0, self._market_perp("Sell", qty, reduce_only=False)
+        price = self._touch_price("linear", "Sell")
+        if price is None:
+            return qty, self._market_perp("Sell", qty, reduce_only=False)
+        order, link = self._rest_maker(
+            "linear", "Sell", _fmt_step(qty, self.cfg.qty_step), price,
+            reduce_only=False, leg="mk-short",
+        )
+        if order is None:
+            return qty, self._market_perp("Sell", qty, reduce_only=False)
+        filled = self._await_maker(link, order, "linear")
+        remaining = qty - filled
+        if remaining > self.cfg.qty_step:
+            log.info("maker_perp_topup", limit_filled=filled, remaining=remaining)
+            return qty, self._market_perp("Sell", remaining, reduce_only=False)
+        return filled, order
+
+    def _maker_buy_spot(self, hedge_qty: float, price: float) -> dict:
+        """Long the spot hedge: PostOnly Buy at bid1, market top-up.
+
+        Spot LIMIT orders take BASE qty (unlike Market BUY which takes
+        QUOTE/USDT), and the fee is deducted from the received base coin, so
+        the limit qty is grossed up by 1/(1-fee) to NET exactly hedge_qty.
+        """
+        fee = self.cfg.spot_taker_fee
+        if not self.cfg.maker_enabled or price <= 0:
+            return self._market_spot_buy(hedge_qty, price)
+        gross_base = hedge_qty / (1.0 - fee) if fee > 0 else hedge_qty
+        limit_price = self._touch_price("spot", "Buy")
+        if limit_price is None:
+            return self._market_spot_buy(hedge_qty, price)
+        order, link = self._rest_maker(
+            "spot", "Buy", _fmt_step(gross_base, self._spot_qty_step()),
+            limit_price, reduce_only=False, leg="mk-spot",
+        )
+        if order is None:
+            return self._market_spot_buy(hedge_qty, price)
+        filled = self._await_maker(link, order, "spot")
+        # The fee already came out of the limit fill → net hedge is less.
+        net = filled * (1.0 - fee) if fee > 0 else filled
+        rem_net = hedge_qty - net
+        if rem_net <= 0 or rem_net * price < max(self.cfg.min_notional, 1.0):
+            return order  # dust remainder — under-hedge ≤ $5, acceptable
+        log.info("maker_spot_topup", limit_filled=filled, rem_net=rem_net)
+        return self._market_spot_buy(rem_net, price)
+
+    def _maker_close_perp(self, qty: float) -> dict | None:
+        """Buy back the perp short: PostOnly at bid1 (reduceOnly), top-up."""
+        price = self._touch_price("linear", "Buy")
+        if price is None:
+            return self._market_perp("Buy", qty, reduce_only=True)
+        order, link = self._rest_maker(
+            "linear", "Buy", _fmt_step(qty, self.cfg.qty_step), price,
+            reduce_only=True, leg="mk-cover",
+        )
+        if order is None:
+            return self._market_perp("Buy", qty, reduce_only=True)
+        filled = self._await_maker(link, order, "linear")
+        remaining = qty - filled
+        if remaining > self.cfg.qty_step:
+            log.info("maker_cover_topup", limit_filled=filled, remaining=remaining)
+            return self._market_perp("Buy", remaining, reduce_only=True)
+        return order
+
+    def _maker_sell_spot(self, qty: float) -> dict | None:
+        """Sell the spot hedge: PostOnly Sell at ask1 (base qty), top-up."""
+        price = self._touch_price("spot", "Sell")
+        if price is None:
+            return self._market_spot_sell(qty)
+        order, link = self._rest_maker(
+            "spot", "Sell", _fmt_step(qty, self._spot_qty_step()), price,
+            reduce_only=False, leg="mk-unwind",
+        )
+        if order is None:
+            return self._market_spot_sell(qty)
+        filled = self._await_maker(link, order, "spot")
+        remaining = qty - filled
+        try:
+            px = float(price)
+        except ValueError:
+            px = 0.0
+        if remaining > 0 and px > 0 and remaining * px >= max(self.cfg.min_notional, 1.0):
+            log.info("maker_unwind_topup", limit_filled=filled, remaining=remaining)
+            return self._market_spot_sell(remaining)
+        return order
+
     def _open(self, act: CarryAction) -> dict:
         log.info(
             "carry_open", reason=act.reason, qty=act.qty,
             funding=act.funding_rate, basis_bps=act.basis_bps,
         )
-        # Short the perpetual (market, reduce-only off — opening).
-        # If the perp leg itself is rejected there is no position to roll back,
-        # but _decide_flat() already optimistically set state=HEDGED — undo it
-        # (C2: state must reflect REALITY, not intent) and arm the cooldown so
-        # we don't retry every poll.
+        # Short the perpetual — maker first (PostOnly at the ask), market
+        # fallback inside.  If the perp leg itself fails there is no position
+        # to roll back, but _decide_flat() already optimistically set
+        # state=HEDGED — undo it (C2: state must reflect REALITY, not intent)
+        # and arm the cooldown so we don't retry every poll.
         try:
-            perp = self.exchange.place_order({
-                "symbol": self.cfg.symbol, "side": act.perp_side,
-                "orderType": "Market", "qty": str(act.qty),
-                "orderLinkId": self._order_link_id("open-perp"),
-            })
+            perp_filled, perp = self._maker_short_perp(act.qty)
         except Exception as exc:
             log.error("carry_open_perp_failed", error=str(exc))
             self._arm_open_cooldown()
             self.state = CarryState.FLAT
             self.position_qty = 0.0
             raise
-        # C3: verify the REAL perp fill before sizing the spot hedge.  A market
-        # order can partial-fill or be lot-rounded by the exchange; hedging the
-        # REQUESTED qty instead of the ACTUAL fill leaves an unhedged delta.
-        # Fall back to the requested qty only if the position can't be read.
-        hedge_qty = self._actual_perp_size() or act.qty
+        # C3: verify the REAL perp fill before sizing the spot hedge.  Maker
+        # partial fills + market top-ups make lot-rounding the norm, not the
+        # exception; hedging the REQUESTED qty instead of the ACTUAL fill
+        # leaves an unhedged delta.  Fall back to the reported fill only if
+        # the position can't be read.
+        hedge_qty = self._actual_perp_size() or perp_filled or act.qty
         if abs(hedge_qty - act.qty) > 1e-12:
             log.info("carry_open_fill_adjusted", requested=act.qty, filled=hedge_qty)
         self.position_qty = hedge_qty  # confirm to the real fill (C2)
-        # Long the spot hedge.  Bybit V5 spot Market BUY takes qty in QUOTE
-        # currency (USDT), not base (BTC) — so we convert qty_btc → USDT
-        # notional.  (Market SELL still uses base-currency qty; see _close.)
+        # Long the spot hedge (maker first, market fallback inside).
         # CRITICAL: if the spot leg fails we must ROLL BACK the perp short
         # immediately — an unhedged short has unlimited loss risk (squeeze) —
         # and arm the cooldown so the loop doesn't re-open straight away.
         price = act.spot_price or act.perp_price
-        # P3-15: gross up the USDT order by 1/(1-fee) so the NET received BTC
-        # (after the spot taker fee is deducted from the base coin) matches the
-        # perp short size exactly — keeping the hedge truly delta-neutral.
-        fee = self.cfg.spot_taker_fee
-        gross = hedge_qty * price / (1.0 - fee) if fee > 0 else hedge_qty * price
-        spot_qty_usdt = round(gross, 2) if price > 0 else 0.0
         try:
-            spot = self.exchange.place_spot_order({
-                "symbol": self.cfg.symbol, "side": act.spot_side,
-                "orderType": "Market", "qty": str(spot_qty_usdt),
-                "orderLinkId": self._order_link_id("open-spot"),
-            })
+            spot = self._maker_buy_spot(hedge_qty, price)
         except Exception as exc:
             log.error("carry_open_spot_failed", error=str(exc))
             self._emergency_close_perp(hedge_qty)
@@ -599,6 +885,10 @@ class CarryStrategy:
     def _close(self, act: CarryAction) -> dict | None:
         qty = act.qty or self.position_qty
         log.info("carry_close", qty=qty, reason=act.reason)
+        # Basis-guard closes are EMERGENCIES (squeeze in progress): cross the
+        # spread immediately with market orders.  Everything else (EV exit,
+        # rotation, max-hold, shutdown) can afford maker fills to save fees.
+        urgent = "basis guard" in act.reason
         # Buy back the perp short (reduceOnly ensures it only closes).
         # C2: if the perp close itself fails, we are STILL genuinely hedged — do
         # NOT reset state to FLAT (that would create a phantom-flat and the next
@@ -606,11 +896,10 @@ class CarryStrategy:
         # the next poll retry.  Return None so no trade-log row is written for a
         # close that didn't actually happen.
         try:
-            perp = self.exchange.place_order({
-                "symbol": self.cfg.symbol, "side": "Buy",
-                "orderType": "Market", "qty": str(qty), "reduceOnly": True,
-                "orderLinkId": self._order_link_id("close-perp"),
-            })
+            if urgent or not self.cfg.maker_enabled:
+                perp = self._market_perp("Buy", qty, reduce_only=True)
+            else:
+                perp = self._maker_close_perp(qty)
         except Exception as exc:
             log.error("carry_close_perp_failed", error=str(exc), qty=qty)
             # C2: the close did NOT happen — decide() already optimistically
@@ -628,11 +917,10 @@ class CarryStrategy:
         sell_qty = spot_size if spot_size > 0 else qty
         spot: dict | None = None
         try:
-            spot = self.exchange.place_spot_order({
-                "symbol": self.cfg.symbol, "side": "Sell",
-                "orderType": "Market", "qty": str(round(sell_qty, 8)),
-                "orderLinkId": self._order_link_id("close-spot"),
-            })
+            if urgent or not self.cfg.maker_enabled:
+                spot = self._market_spot_sell(sell_qty)
+            else:
+                spot = self._maker_sell_spot(sell_qty)
         except Exception as exc:
             # Perp is closed; leftover spot is not dangerous (no liquidation
             # risk on a spot long), but log so the operator can clean up.
@@ -663,7 +951,13 @@ class CarryStrategy:
             )
             log.info("carry_stop_loss_set", sl_price=sl_price, pct=self.cfg.stop_loss_pct)
         except Exception as exc:
-            log.warning("carry_stop_loss_set_failed", error=str(exc))
+            if "34040" in str(exc):
+                # "not modified" — the SAME SL is already resting on the
+                # position (e.g. re-verified on restart/resume). The desired
+                # protection is in place; this is success, not a failure.
+                log.info("carry_stop_loss_already_set", sl_price=sl_price)
+            else:
+                log.warning("carry_stop_loss_set_failed", error=str(exc))
 
     def _clear_exchange_stop_loss(self) -> None:
         """Remove the exchange-side stop-loss (called on close)."""

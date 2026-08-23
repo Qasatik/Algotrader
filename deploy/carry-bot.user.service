@@ -28,7 +28,7 @@
 # collecting funding across restarts.
 
 [Unit]
-Description=Bybit carry bot — MULTI top-5 by funding rate (LIVE mainnet, user service)
+Description=Bybit carry bot — MULTI top-5 by EV (LIVE mainnet, user service)
 After=network-online.target
 Wants=network-online.target
 
@@ -38,14 +38,24 @@ WorkingDirectory=%h/bybit-algo-bot
 Environment=PYTHONPATH=.
 Environment=PYTHONUNBUFFERED=1
 
-# Multi-symbol mode: scan the 14-coin universe, rank by funding rate, keep the
-# TOP-5 open. Capital is split into 5 equal slots (equity/5 each). max-notional
+# Multi-symbol mode (Phase0): auto-discover the universe (USDT pairs with
+# BOTH spot+perp legs, ≥$5M 24h turnover), rank by EV = funding − basis −
+# amortized fees, keep the TOP-5 open. Entries only EV-positive, within 45min
+# before a funding slot (00/08/16 UTC), executed as post-only makers with a
+# market top-up after 45s. Capital is split into 5 equal slots; max-notional
 # is a PER-SLOT cap. Same conservative risk params as before.
 ExecStart=/usr/bin/python3 scripts/run_carry_multi.py \
     --mainnet --yes \
     --top-n 5 \
     --interval 10 \
+    --universe-auto \
+    --universe-size 80 \
+    --min-turnover 5000000 \
     --min-funding 0.00005 \
+    --min-ev 0 \
+    --entry-window 45 \
+    --entry-blackout 10 \
+    --maker-timeout 45 \
     --max-notional 70 \
     --leverage 2 \
     --equity-fraction 0.7
