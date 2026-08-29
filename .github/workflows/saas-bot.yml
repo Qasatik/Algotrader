@@ -45,6 +45,7 @@ jobs:
 
       - name: Run bot (26 min shift)
         env:
+          PYTHONPATH: .
           SAAS_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           SAAS_MASTER_SECRET: ${{ secrets.SAAS_MASTER_SECRET }}
           SAAS_ADMIN_IDS: ${{ secrets.SAAS_ADMIN_IDS }}
