@@ -31,10 +31,13 @@ Group=pepe
 WorkingDirectory=/home/pepe/bybit-algo-bot
 Environment=PYTHONPATH=.
 
+# api.bybit.com DNS is blocked on some RU ISPs — set a proxy if needed:
+# Environment=HTTPS_PROXY=http://127.0.0.1:7890
+# Environment=NO_PROXY=localhost,127.0.0.1
 ExecStart=/usr/bin/python3 scripts/run_carry_testnet.py \
     --mainnet --yes \
     --interval 10 \
-    --min-funding 0.00005 \
+    --min-funding 0.0003 \
     --max-notional 70 \
     --leverage 2 \
     --equity-fraction 0.7

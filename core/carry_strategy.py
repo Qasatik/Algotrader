@@ -62,8 +62,15 @@ class CarryConfig:
     exit_hold_horizon: int = 10  # funding cycles (8h) projected: hold-vs-close break-even
     exit_confirm_polls: int = 3  # consecutive warranted polls before closing (anti-churn)
     basis_guard_bps: float = 50.0  # flatten if perp premium > 50 bps (0.5%)
-    rebalance_drift_bps: float = 20.0  # rebalance hedge if basis drifts > 20 bps
-    rebalance_min_btc: float = 0.001  # min BTC mismatch to trigger a corrective order
+    # Rebalance only on MEANINGFUL basis drift. 20 bps is inside normal alt
+    # noise (2026-08-25..26: 881 rebalance signals in 2 days on 20-37 bps
+    # drift — pure fee churn). 100 bps = real dislocation worth correcting.
+    rebalance_drift_bps: float = 100.0  # rebalance hedge if basis drifts > 100 bps
+    rebalance_min_btc: float = 0.001  # min base-coin mismatch to trigger a corrective order
+    # Min mismatch VALUE in USDT for a corrective order. Below this the
+    # order is either dust (< Bybit $5 spot min → rejected) or costs more
+    # in fees than the hedge error it fixes. Baseline is still reset.
+    rebalance_min_usdt: float = 10.0
     # Conviction-weighted sizing: scale size with entry confidence (P-profit proxy).
     strong_funding: float = 0.0003  # funding rate (0.03%) at which confidence = 1.0
     size_mult_min: float = 0.75  # size multiplier at zero confidence
@@ -725,10 +732,16 @@ class CarryStrategy:
         })
 
     def _market_spot_sell(self, qty: float) -> dict:
-        """Market spot SELL (base-currency qty)."""
+        """Market spot SELL (base-currency qty).
+
+        Qty is floored to the spot lot step (basePrecision): Bybit rejects
+        "Order quantity has too many decimals" (170137) otherwise, which on
+        2026-08-27 left a 209.8699 HUSDT naked spot long after the perp leg
+        had already closed.
+        """
         return self.exchange.place_spot_order({
             "symbol": self.cfg.symbol, "side": "Sell",
-            "orderType": "Market", "qty": str(round(qty, 8)),
+            "orderType": "Market", "qty": _fmt_step(qty, self._spot_qty_step()),
             "orderLinkId": self._order_link_id("close-spot"),
         })
 
@@ -1044,10 +1057,14 @@ class CarryStrategy:
             "rebalanced": False, "perp_size": perp_size,
             "spot_size": spot_size, "delta_btc": delta,
         }
-        if abs(delta) < self.cfg.rebalance_min_btc or price <= 0:
+        mismatch_usdt = abs(delta) * price
+        if (abs(delta) < self.cfg.rebalance_min_btc or price <= 0
+                or mismatch_usdt < self.cfg.rebalance_min_usdt):
             log.info(
                 "carry_rebalance_skipped", delta_btc=delta,
                 min_btc=self.cfg.rebalance_min_btc,
+                mismatch_usdt=round(mismatch_usdt, 2),
+                min_usdt=self.cfg.rebalance_min_usdt,
             )
             self.entry_basis_bps = act.basis_bps
             return result
@@ -1062,10 +1079,12 @@ class CarryStrategy:
                 log.info("carry_rebalance_buy_spot", qty_usdt=qty_usdt, delta_btc=delta)
             else:
                 # Net long → trim the spot long. Spot Market SELL qty is BTC.
-                qty_btc = round(abs(delta), 8)
+                # Round DOWN to the spot lot step — Bybit rejects quantities
+                # with more decimals than basePrecision (170137).
+                qty_btc = _fmt_step(abs(delta), self._spot_qty_step())
                 self.exchange.place_spot_order({
                     "symbol": self.cfg.symbol, "side": "Sell",
-                    "orderType": "Market", "qty": str(qty_btc),
+                    "orderType": "Market", "qty": qty_btc,
                 })
                 log.info("carry_rebalance_sell_spot", qty_btc=qty_btc, delta_btc=delta)
             result["rebalanced"] = True

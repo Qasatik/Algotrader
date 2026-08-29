@@ -1,0 +1,39 @@
+# AlgoTrader SaaS Telegram bot — USER systemd service unit.
+# The sales funnel: /start -> /pricing -> /subscribe -> /pay (USDT TRC-20)
+# with admin confirmation (/admin_pay), referrals, tenant trading control.
+#
+# BEFORE enabling:
+#   1. Create a DEDICATED bot via @BotFather (do NOT reuse the trading bot's
+#      token — two pollers on one token get Telegram 409 Conflict).
+#   2. Put the token in .env as SAAS_BOT_TOKEN=...
+#   3. Put your numeric Telegram ID in SAAS_ADMIN_IDS (get it from @userinfobot)
+#      — without it nobody can confirm incoming payments.
+#   4. Put your USDT TRC-20 wallet in SAAS_USDT_WALLET (empty = manual gateway).
+#
+# Install:
+#   cp deploy/carry-saas.user.service ~/.config/systemd/user/carry-saas.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now carry-saas
+#
+# Logs:
+#   journalctl --user -u carry-saas -f
+
+[Unit]
+Description=AlgoTrader SaaS bot — sales funnel + tenant trading (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bybit-algo-bot
+Environment=PYTHONPATH=.
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/bybit-algo-bot/.env
+ExecStart=/usr/bin/python3 scripts/run_saas_bot.py
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

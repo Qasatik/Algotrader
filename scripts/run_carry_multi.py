@@ -93,8 +93,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--leverage", type=int, default=2)
     ap.add_argument("--equity-fraction", type=float, default=0.5)
     ap.add_argument("--basis-guard-bps", type=float, default=50.0)
-    ap.add_argument("--min-funding", type=float, default=0.0001,
-                    help="open when funding >= this (default 0.01%%)")
+    ap.add_argument("--min-funding", type=float, default=0.0003,
+                    help="open when funding >= this (default 0.03%% — below "
+                         "that the amortized round-trip fee (3.1bps/cycle) "
+                         "eats the funding income)")
     ap.add_argument("--max-notional", type=float, default=None,
                     help="hard cap on position notional USDT PER SLOT (safety)")
     ap.add_argument("--min-notional", type=float, default=5.0,
@@ -157,9 +159,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--maker-timeout", type=float, default=45.0,
                     help="seconds to wait per leg for a maker fill before "
                          "market top-up (default 45)")
-    ap.add_argument("--min-ev", type=float, default=0.0,
+    ap.add_argument("--min-ev", type=float, default=2.0,
                     help="min entry EV in bps per 8h cycle: funding − basis − "
-                         "amortized fees (default 0 = only EV-positive entries)")
+                         "amortized fees (default 2 = require a real edge, "
+                         "not just break-even; 0 = only EV-positive entries)")
     ap.add_argument("--entry-window", type=float, default=45.0,
                     help="open only within N minutes BEFORE a funding slot "
                          "00/08/16 UTC (default 45; 0 = off)")
@@ -312,6 +315,7 @@ def _discover_universe(
 def _scan_and_rank(
     exchange: BybitExchange, candidates: list[str], top_n: int, min_funding: float,
     exit_cost_bps: float = 31.0, exit_hold_horizon: int = 10,
+    min_ev_bps: float = 0.0,
 ) -> tuple[list[str], dict[str, float]]:
     """Scan candidates; return (top-N symbols by EV, {sym: EV bps}).
 
@@ -320,6 +324,12 @@ def _scan_and_rank(
     symbols both paying +0.01% are NOT equal if one has a −20bps perp
     discount (convergence loss) — the raw funding rank never saw that.
     ``min_funding`` stays a hard pre-filter (absolute income floor).
+
+    P1 fix (2026-08-29): eligible symbols must ALSO clear ``min_ev_bps``.
+    Before, the top-N was filtered by funding only and ranked by EV — with
+    weak funding everywhere the "top-5" were simply the least-negative-EV
+    symbols (logs showed −2.1…−2.6 bps), i.e. rotation kept feeding the
+    per-symbol EV gate candidates that could never open profitably.
     """
     fee_bps = exit_cost_bps / max(exit_hold_horizon, 1)
     funding_map: dict[str, float] = {}
@@ -339,7 +349,8 @@ def _scan_and_rank(
             log.warning("scan_symbol_failed", symbol=sym, error=str(exc))
     eligible = [
         (s, ev_map.get(s, funding_map[s] * 10_000.0 - fee_bps))
-        for s, f in funding_map.items() if f >= min_funding
+        for s, f in funding_map.items()
+        if f >= min_funding and ev_map.get(s, -1e9) >= min_ev_bps
     ]
     eligible.sort(key=lambda x: x[1], reverse=True)
     top = [s for s, _ in eligible[:top_n]]
@@ -504,6 +515,7 @@ def main() -> None:
         top, fmap = _scan_and_rank(
             exchange, candidates, args.top_n, args.min_funding,
             exit_cost_bps=31.0, exit_hold_horizon=10,
+            min_ev_bps=args.min_ev,
         )
         for sym in top:
             _ensure_strategy(pool, exchange, sym, args, per_slot_equity)
@@ -589,6 +601,7 @@ def main() -> None:
             top, fmap = _scan_and_rank(
                 exchange, candidates, args.top_n, args.min_funding,
                 exit_cost_bps=31.0, exit_hold_horizon=10,
+                min_ev_bps=args.min_ev,
             )
             for sym in list(can_open):
                 can_open[sym] = sym in top

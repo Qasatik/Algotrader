@@ -6,7 +6,11 @@ the full stack — database, user manager, billing service, payment gateway,
 tenant runner, and the Telegram poller — from environment variables.
 
 Environment:
-    TELEGRAM_BOT_TOKEN   — Telegram bot token from @BotFather
+    SAAS_BOT_TOKEN       — token of the SALES bot from @BotFather (dedicated
+                           bot; MUST be separate from the trading bot's
+                           TELEGRAM_BOT_TOKEN — two pollers on one token get
+                           Telegram 409 Conflict errors)
+    TELEGRAM_BOT_TOKEN   — fallback if SAAS_BOT_TOKEN is not set
     SAAS_MASTER_SECRET   — AES-256 master secret for API-key encryption
                            (generate once: python3 -c "from saas.crypto import
                            generate_master_secret as g; print(g())")
@@ -16,7 +20,7 @@ Environment:
                            (if empty, falls back to manual admin confirmation)
 
 Usage:
-    env TELEGRAM_BOT_TOKEN=xxx SAAS_MASTER_SECRET=yyy \
+    env SAAS_BOT_TOKEN=xxx SAAS_MASTER_SECRET=yyy \
         SAAS_ADMIN_IDS=123456 SAAS_USDT_WALLET=Txxx \
         python3 scripts/run_saas_bot.py
 """
@@ -34,7 +38,7 @@ from saas.user_manager import UserManager
 
 def build_from_env() -> SaaSTelegramBot:
     """Construct the full SaaS stack from environment variables."""
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    token = os.environ.get("SAAS_BOT_TOKEN") or os.environ["TELEGRAM_BOT_TOKEN"]
     secret = os.environ["SAAS_MASTER_SECRET"]
     db_path = os.environ.get("SAAS_DB_PATH", DEFAULT_DB_PATH)
     admin_ids = [
@@ -60,7 +64,7 @@ def main() -> None:
     except KeyError as exc:
         print(f"❌ Missing env var: {exc}", file=sys.stderr)
         print(
-            "Required: TELEGRAM_BOT_TOKEN, SAAS_MASTER_SECRET\n"
+            "Required: SAAS_BOT_TOKEN (or TELEGRAM_BOT_TOKEN), SAAS_MASTER_SECRET\n"
             "Optional: SAAS_DB_PATH, SAAS_ADMIN_IDS, SAAS_USDT_WALLET",
             file=sys.stderr,
         )

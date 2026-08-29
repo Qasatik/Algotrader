@@ -37,6 +37,11 @@ Type=simple
 WorkingDirectory=%h/bybit-algo-bot
 Environment=PYTHONPATH=.
 Environment=PYTHONUNBUFFERED=1
+# api.bybit.com DNS is blocked on some RU ISPs (1500+ failed requests in the
+# 2026-08-27..29 logs). requests/urllib3 honor these automatically — set your
+# own proxy (or delete if not needed):
+# Environment=HTTPS_PROXY=http://127.0.0.1:7890
+# Environment=NO_PROXY=localhost,127.0.0.1
 
 # Multi-symbol mode (Phase0): auto-discover the universe (USDT pairs with
 # BOTH spot+perp legs, ≥$5M 24h turnover), rank by EV = funding − basis −
@@ -51,8 +56,8 @@ ExecStart=/usr/bin/python3 scripts/run_carry_multi.py \
     --universe-auto \
     --universe-size 80 \
     --min-turnover 5000000 \
-    --min-funding 0.00005 \
-    --min-ev 0 \
+    --min-funding 0.0003 \
+    --min-ev 2 \
     --entry-window 45 \
     --entry-blackout 10 \
     --maker-timeout 45 \
