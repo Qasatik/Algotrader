@@ -36,6 +36,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_PHONE: ${{ inputs.phone }}
           TG_CHANNEL_TITLE: ${{ inputs.title }}
+          PYTHONUNBUFFERED: "1"
         run: |
           echo "::add-mask::$TG_PHONE"
           python scripts/tg_create_channel.py
