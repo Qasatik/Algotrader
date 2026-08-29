@@ -51,18 +51,25 @@ jobs:
           SAAS_ADMIN_IDS: ${{ secrets.SAAS_ADMIN_IDS }}
           SAAS_USDT_WALLET: ${{ secrets.SAAS_USDT_WALLET }}
           SAAS_DB_PATH: data/saas.db
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ADMIN_CHAT_ID: "60924861"
         run: |
           set -o pipefail
           timeout --signal=SIGINT --kill-after=20 1560 python3 scripts/run_saas_bot.py 2>&1 | tee /tmp/bot.log
           rc=$?
-          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-            ERR=$(tail -c 3000 /tmp/bot.log)
-            curl -s -X POST "https://api.telegram.org/bot${SAAS_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TG_CHAT_ID}" \
-              --data-urlencode text="saas-bot crashed (rc=$rc): ${ERR}" >/dev/null || true
-            exit 1
-          fi
+          # 0 = clean exit, 124 = timeout SIGINT, 130 = SIGINT death,
+          # 137 = SIGKILL (kill-after), 143 = SIGTERM — all clean shift ends.
+          case "$rc" in
+            0|124|130|137|143)
+              echo "shift ended cleanly (rc=$rc)"
+              ;;
+            *)
+              ERR=$(tail -c 3000 /tmp/bot.log)
+              curl -s -X POST "https://api.telegram.org/bot${SAAS_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${ADMIN_CHAT_ID}" \
+                --data-urlencode text="saas-bot crashed (rc=$rc): ${ERR}" >/dev/null || true
+              exit 1
+              ;;
+          esac
 
       - name: Save DB
         if: always()
