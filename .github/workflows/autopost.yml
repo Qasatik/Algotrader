@@ -43,7 +43,7 @@ jobs:
 
       - name: Already sent? (cache gate)
         id: sent
-        if: inputs.post_index == '' && !inputs.debug
+        if: "!inputs.debug"
         uses: actions/cache@v4
         with:
           path: .sent-marker

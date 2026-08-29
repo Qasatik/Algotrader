@@ -1,0 +1,41 @@
+name: Create Telegram channel (one-shot)
+
+# One-time setup: creates the marketing channel from the owner's account
+# via MTProto, promotes @Alg0tr4debot to admin and prints TG_CHAT_ID.
+# The owner confirms the login code by forwarding it to the bot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone:
+        description: "Owner phone, international format (+7...)"
+        required: true
+      title:
+        description: "Channel title"
+        required: false
+        default: "AlgoTrader — фандинг на автопилоте"
+
+permissions:
+  contents: read
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install "telethon>=1.36,<2" cryptg
+
+      - name: Create channel, promote bot
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_PHONE: ${{ inputs.phone }}
+          TG_CHANNEL_TITLE: ${{ inputs.title }}
+        run: |
+          echo "::add-mask::$TG_PHONE"
+          python scripts/tg_create_channel.py
