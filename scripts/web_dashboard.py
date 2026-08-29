@@ -13,7 +13,8 @@ Runs a tiny Flask app (localhost by default):
     - funding ranking (horizontal bars)
     - position notional distribution (doughnut)
 * metrics: total return, max drawdown, buckets count
-* recent trades from data/carry_trades.csv
+* recent trades from data/carry_trades.csv + realised PnL per trade
+  (matched against Bybit closed-PnL records)
 
 Best practices applied:
 * READ-ONLY — the dashboard never places orders
@@ -64,10 +65,12 @@ app = Flask(__name__, static_folder=str(Path(__file__).resolve().parent.parent /
 _ex: BybitExchange | None = None
 
 _cache: dict = {"scan": None, "scan_ts": 0.0, "svc": None, "svc_ts": 0.0,
-                "pnl": None, "pnl_ts": 0.0}
+                "pnl": None, "pnl_ts": 0.0, "cpnl": None, "cpnl_ts": 0.0}
 SCAN_TTL = 60.0
 SVC_TTL = 10.0
 PNL_TTL = 120.0
+CPNL_TTL = 120.0  # closed-PnL records (per-trade realised profit)
+CPNL_MATCH_TOL_S = 900.0  # max |log ts − exchange ts| to pair a trade (15 min)
 
 
 def _f(v, default: float = 0.0) -> float:
@@ -284,6 +287,74 @@ def _positions(scan: list[dict]) -> list[dict]:
     return out
 
 
+def _ts_epoch(ts_iso: str) -> float | None:
+    """ISO timestamp → epoch seconds (None if unparseable)."""
+    try:
+        return datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _closed_pnl() -> list[dict]:
+    """Bybit closed-PnL records — realised money per closed position chunk.
+
+    Ground truth for "сколько сделка принесла/съела с баланса": the local
+    trade CSV has no PnL column and equity snapshots fire only every ~2 h
+    (too coarse to attribute per trade). Cached; best-effort — [] when the
+    API is unreachable.
+    """
+    now = time.time()
+    if _cache["cpnl"] is None or now - _cache["cpnl_ts"] > CPNL_TTL:
+        try:
+            _cache["cpnl"] = _ex.get_closed_pnl(limit=100) or []
+        except Exception:
+            _cache["cpnl"] = []
+        _cache["cpnl_ts"] = now
+    return _cache["cpnl"]
+
+
+def _attach_trade_pnl(trades: list[dict]) -> None:
+    """Set t["pnl"] = realised PnL (USDT) for close/rebalance trade rows.
+
+    Each logged close/rebalance is matched 1:1 (greedy, nearest-time first)
+    to a Bybit closed-PnL record of the same symbol. Opens and unmatched
+    rows keep pnl=None → the GUI renders them as "—".
+    """
+    recs: list[tuple[str, float, float]] = []  # (symbol, epoch, pnl)
+    for r in _closed_pnl():
+        ts_ms = r.get("createdTime") or r.get("updatedTime") or 0
+        try:
+            epoch = int(ts_ms) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        if epoch <= 0:
+            continue
+        recs.append((str(r.get("symbol", "")), epoch, _f(r.get("closedPnl"))))
+
+    pairs: list[tuple[float, int, int]] = []  # (|Δt|, trade_idx, rec_idx)
+    for ti, t in enumerate(trades):
+        t["pnl"] = None
+        if t.get("action") not in ("close", "rebalance"):
+            continue
+        ts = _ts_epoch(t.get("timestamp", ""))
+        if ts is None:
+            continue
+        for ri, (sym, epoch, _pnl) in enumerate(recs):
+            if sym and sym == t.get("symbol"):
+                dt = abs(epoch - ts)
+                if dt <= CPNL_MATCH_TOL_S:
+                    pairs.append((dt, ti, ri))
+    pairs.sort()
+    used_t: set[int] = set()
+    used_r: set[int] = set()
+    for _dt, ti, ri in pairs:
+        if ti in used_t or ri in used_r:
+            continue
+        trades[ti]["pnl"] = round(recs[ri][2], 4)
+        used_t.add(ti)
+        used_r.add(ri)
+
+
 def _recent_trades(n: int = 12) -> list[dict]:
     if not TRADES_CSV.exists():
         return []
@@ -300,9 +371,11 @@ def _recent_trades(n: int = 12) -> list[dict]:
                 continue
             clean.append({k: v for k, v in r.items() if isinstance(k, str)})
         clean.reverse()
-        return clean[:n]
+        trades = clean[:n]
     except Exception:
         return []
+    _attach_trade_pnl(trades)
+    return trades
 
 
 def collect(bucket: str = "day") -> dict:
@@ -416,12 +489,18 @@ function render(d){
     `<td>${(r.funding_pct*3*365>=0?'+':'')+(r.funding_pct*3*365).toFixed(1)}%</td>`+
     `<td>${(r.basis_bps>=0?'+':'')+r.basis_bps.toFixed(1)}</td></tr>`).join('');
 
-  // trades table
+  // trades table (+ realised PnL per trade, matched from Bybit closed-PnL)
   document.getElementById('trbody').innerHTML = d.trades.length
-    ? d.trades.map(t=>`<tr><td>${(t.timestamp||'').slice(0,19)}</td>`+
+    ? d.trades.map(t=>{
+      const p=Number(t.pnl);
+      const pnlCell=(t.pnl==null||isNaN(p))
+        ? '<td class="muted">—</td>'
+        : `<td class="${p>=0?'ok':'bad'}">${(p>=0?'+':'')+FMT(p)}</td>`;
+      return `<tr><td>${(t.timestamp||'').slice(0,19)}</td>`+
       `<td>${t.action||''}</td><td>${t.symbol||''}</td><td>${t.side||''}</td>`+
-      `<td>${t.qty||''}</td><td class="muted">${esc((t.reason||'').slice(0,60))}</td></tr>`).join('')
-    : '<tr><td colspan="6" class="muted">история сделок пуста</td></tr>';
+      `<td>${t.qty||''}</td>${pnlCell}`+
+      `<td class="muted">${esc((t.reason||'').slice(0,60))}</td></tr>`;}).join('')
+    : '<tr><td colspan="7" class="muted">история сделок пуста</td></tr>';
 
   // metrics — empty-state until at least 2 history buckets exist
   const noData=!eq.has_data;
@@ -551,8 +630,11 @@ PAGE = """<!DOCTYPE html><html lang="ru"><head>
 
 <h2>История сделок (последние)</h2>
 <table><thead><tr><th>Время (UTC)</th><th>Действие</th><th>Символ</th>
-<th>Сторона</th><th>Кол-во</th><th>Причина</th></tr></thead>
+<th>Сторона</th><th>Кол-во</th><th>Прибыль ±, USDT</th><th>Причина</th></tr></thead>
 <tbody id="trbody"></tbody></table>
+<p class="muted" style="font-size:.7rem">± прибыль к балансу — реализованный PnL
+с биржи (Bybit closed-PnL), подбирается по символу и времени закрытия ·
+«—» — сделка ещё не закрыта / записи нет</p>
 
 <footer>carry-dashboard · read-only · никакие ордера не отправляются</footer>
 </body></html>"""
