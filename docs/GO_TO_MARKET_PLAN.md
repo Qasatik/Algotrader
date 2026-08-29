@@ -14,13 +14,16 @@ $10 000 выручки за 3-4 месяца.
 4. Запуск бота продаж:
    `systemctl --user enable --now carry-saas`
    Проверка: написать боту `/start`, потом `/pricing`.
-5. Создать Telegram-канал (название вида «AlgoTrader — фандинг на автопилоте»),
-   добавить бота продаж администратором, ID канала (`@username`) → `.env`
-   в `TG_AUTOPOST_CHAT=...`.
-6. Запустить автопост:
-   `cp deploy/tg-autopost.{service,timer} ~/.config/systemd/user/ && \
-    systemctl --user daemon-reload && systemctl --user enable --now tg-autopost.timer`
-   Первый пост выйдет в день старта, далее — по графику (дни 1-19).
+5. Создать Telegram-канал (название вида «AlgoTrader — фандинг на автопилоте»)
+   и добавить бота продаж администратором канала.
+6. Автопост работает через GitHub Actions (провайдер режет api.telegram.org,
+   локальный таймер `tg-autopost.timer` не используется):
+   - секреты репозитория: `TG_BOT_TOKEN` (токен бота) и `TG_CHAT_ID`
+     (`@username` канала или числовой `-100...`);
+   - воркфлоу `.github/workflows/autopost.yml` сам постит по одному посту
+     раз в 2 дня в 12:00 МСК (дни 1-19), ручной запуск — вкладка Actions;
+   - проверка токена и поиск ID чатов: Actions → Telegram autopost →
+     Run workflow → debug.
 7. Залить на хостинг лендинга обновлённые `index.html` и новый `offer.html`.
 8. Проверить, что ссылка на бота в шапке канала и на лендинге совпадает
    с реальным @username бота продаж (сейчас в коде заглушка @AlgoTraderBot).

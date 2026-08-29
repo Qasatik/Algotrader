@@ -1,0 +1,64 @@
+name: Telegram autopost
+
+# The local machine cannot reach api.telegram.org (ISP drops packets to
+# Telegram IP ranges), so the marketing channel is fed from GitHub-hosted
+# runners instead. One post every two days at 12:00 MSK; manual runs and
+# a debug mode are available from the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"  # 09:00 UTC = 12:00 MSK daily
+  workflow_dispatch:
+    inputs:
+      post_index:
+        description: "Post number 1-10 (empty = auto by date)"
+        required: false
+        default: ""
+      debug:
+        description: "Validate only (getMe + getUpdates), do not post"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tg-autopost
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compute post index
+        id: idx
+        run: |
+          echo "index=$(python scripts/gh_autopost.py --index)" >> "$GITHUB_OUTPUT"
+
+      - name: Already sent? (cache gate)
+        id: sent
+        if: inputs.post_index == '' && !inputs.debug
+        uses: actions/cache@v4
+        with:
+          path: .sent-marker
+          key: autopost-idx-${{ steps.idx.outputs.index }}
+
+      - name: Validate token and list chats
+        if: inputs.debug || steps.sent.outputs.cache-hit != 'true'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: python scripts/gh_autopost.py --validate
+
+      - name: Publish post
+        if: "!inputs.debug && (inputs.post_index != '' || (steps.sent.outputs.cache-hit != 'true' && steps.idx.outputs.index != '-1'))"
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          POST_INDEX: ${{ inputs.post_index }}
+        run: python scripts/gh_autopost.py --publish && touch .sent-marker
