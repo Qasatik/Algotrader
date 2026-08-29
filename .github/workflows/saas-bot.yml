@@ -1,0 +1,62 @@
+name: SaaS bot (hosted)
+
+# The sales bot cannot run on the local machine (the ISP blocks
+# api.telegram.org), so it runs on GitHub-hosted runners in ~26-minute
+# shifts around the clock. The SQLite database (users, subscriptions,
+# encrypted API keys) is persisted between shifts via a workflow artifact.
+# The repository is public, so Actions minutes are free.
+
+on:
+  schedule:
+    - cron: "4,34 * * * *"  # two shifts per hour, offset from the hour
+  workflow_dispatch:
+
+concurrency:
+  group: saas-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 29
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: >
+          pip install "python-telegram-bot==21.4" "cryptography>=43"
+          structlog qrcode Pillow "pybit==5.9.0" "aiohttp==3.10.11"
+          "websockets==12.0" "tenacity==8.5.0" "python-dotenv==1.0.1"
+          "pydantic==2.8.2" "PyYAML==6.0.1"
+
+      - name: Restore DB
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: saas-db
+          path: data
+
+      - name: Run bot (26 min shift)
+        env:
+          SAAS_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          SAAS_MASTER_SECRET: ${{ secrets.SAAS_MASTER_SECRET }}
+          SAAS_ADMIN_IDS: ${{ secrets.SAAS_ADMIN_IDS }}
+          SAAS_USDT_WALLET: ${{ secrets.SAAS_USDT_WALLET }}
+          SAAS_DB_PATH: data/saas.db
+        run: timeout --signal=SIGINT --kill-after=20 1560 python3 scripts/run_saas_bot.py
+
+      - name: Save DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saas-db
+          path: data/saas.db
+          retention-days: 7
+          if-no-files-found: ignore
