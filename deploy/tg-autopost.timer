@@ -1,0 +1,10 @@
+[Unit]
+Description=Run AlgoTrader Telegram auto-poster daily at 12:00 MSK
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 Europe/Moscow
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

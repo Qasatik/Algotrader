@@ -1,0 +1,13 @@
+[Unit]
+Description=AlgoTrader Telegram channel auto-post (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/bybit-algo-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/bybit-algo-bot/.env
+ExecStart=/usr/bin/python3 scripts/tg_autopost.py
+# api.telegram.org may be blocked on some ISPs — uncomment your proxy:
+# Environment=HTTPS_PROXY=http://127.0.0.1:7890
