@@ -56,10 +56,10 @@ jobs:
           timeout --signal=SIGINT --kill-after=20 1560 python3 scripts/run_saas_bot.py 2>&1 | tee /tmp/bot.log
           rc=$?
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+            ERR=$(tail -c 3000 /tmp/bot.log)
             curl -s -X POST "https://api.telegram.org/bot${SAAS_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TG_CHAT_ID}" \
-              --data-urlencode text="saas-bot crashed (rc=$rc):
-$(tail -c 3000 /tmp/bot.log)" >/dev/null || true
+              --data-urlencode text="saas-bot crashed (rc=$rc): ${ERR}" >/dev/null || true
             exit 1
           fi
 
