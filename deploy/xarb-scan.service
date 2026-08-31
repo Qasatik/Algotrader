@@ -1,0 +1,10 @@
+[Unit]
+Description=XArb X0 funding scanner — log sign-opposite Bybit/OKX slots
+Documentation=file:///home/pepe/bybit-algo-bot/SPEC_CROSS_EXCHANGE_OKX.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pepe/bybit-algo-bot
+ExecStart=/usr/bin/python3 /home/pepe/bybit-algo-bot/scripts/scan_xarb.py --min-ev-bps 10
+# keep the log quiet on failure; journalctl --user -u xarb-scan shows details
+Nice=10

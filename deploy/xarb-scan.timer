@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly XArb X0 funding scan
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
